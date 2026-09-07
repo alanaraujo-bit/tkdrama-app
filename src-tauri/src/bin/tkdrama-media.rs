@@ -10,6 +10,8 @@ struct Validation {
     folder: String,
     mp4: usize,
     thumbs: usize,
+    /// `trailer.mp4` presente e validado. Opcional: falso nao e erro.
+    trailer: bool,
     total_duration_sec: f64,
     all_h264_aac: bool,
     all_faststart: bool,
@@ -69,6 +71,37 @@ async fn validate(dir: &Path) -> anyhow::Result<Validation> {
     }
     if !r.leftovers.is_empty() { r.errors.push("há temporários/TS remanescentes".into()); }
     if r.mp4 != m.episodes.len() { r.errors.push("total do manifesto diverge dos MP4 válidos".into()); }
+
+    // Trailer: opcional, mas se declarado tem de existir e ser MP4 H.264/AAC
+    // com faststart, igual a um episodio.
+    match &m.trailer {
+        Some(rel) => {
+            let caminho = dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            match download::validate_video(&caminho, true).await {
+                Ok(_) => r.trailer = true,
+                Err(e) => { r.all_paths_exist = false; r.errors.push(format!("trailer: {e}")); }
+            }
+        }
+        // Arquivo no disco que o manifesto nao declara e inconsistencia: quem
+        // le o manifesto nunca saberia que ele existe.
+        None if download::validate_video(&dir.join(manifest::TRAILER_FILE), false).await.is_ok() => {
+            r.errors.push("trailer.mp4 existe no disco mas não está no manifesto".into());
+        }
+        None => {}
+    }
+
+    // `totalEpisodes` e a contagem da origem. Divergir dela significa pacote
+    // incompleto — foi assim que "72 declarados, 71 no disco" apareceu.
+    if m.total_episodes as usize != m.episodes.len() {
+        r.errors.push(format!(
+            "totalEpisodes={} mas o manifesto tem {} episódios",
+            m.total_episodes, m.episodes.len()
+        ));
+    }
+    let faltando: Vec<u32> = (1..=m.total_episodes).filter(|n| !m.episodes.contains_key(n)).collect();
+    if !faltando.is_empty() {
+        r.errors.push(format!("episódios faltando: {faltando:?}"));
+    }
     Ok(r)
 }
 
@@ -92,6 +125,12 @@ async fn download_reelshort(url: &str, root: &Path, count: usize) -> anyhow::Res
     let mut m = manifest::read(&dir);
     manifest::patch_series(&mut m, &series, poster);
     let control = Arc::new(AtomicU8::new(download::RUN));
+    // Trailer antes dos episodios: e o arquivo mais leve e o que completa a
+    // pasta para publicacao. Falhar aqui nao impede o resto.
+    if let Ok(Some(t)) = manifest::ensure_trailer(&client, &series, &dir, &session, control.clone()).await {
+        m.trailer = Some(t);
+        manifest::write(&dir, &m)?;
+    }
     for ep in series.episodes.iter().filter(|e| e.available()).take(count) {
         let (segments, _) = reelshort::resolve_media(&client, &lang, &book, ep.number, &ep.item_id, ep.locked, &session).await?;
         let file = format!("{} - E{:02}.mp4", media::safe_name(&series.name), ep.number);

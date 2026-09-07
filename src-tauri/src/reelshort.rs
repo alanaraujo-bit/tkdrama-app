@@ -226,6 +226,31 @@ async fn entitled_episodes(
 
 /// Lista a serie inteira. Episodios pagos entram marcados como trancados, sem
 /// midia — resolver a URL deles seria furar o paywall.
+/// O trailer da novela, se a listagem trouxer um.
+///
+/// No ReelShort ele e o capitulo de `serial_number` 0, misturado aos episodios
+/// em `online_base`, com `chapter_id` proprio e `video_pic` de miniatura.
+fn trailer_de(chapters: &[Value]) -> Option<crate::media::Trailer> {
+    chapters
+        .iter()
+        .find(|c| as_u64(c.get("serial_number")) == 0)
+        .map(|c| crate::media::Trailer {
+            item_id: as_str(c.get("chapter_id")),
+            thumb: as_str(c.get("video_pic")),
+        })
+        .filter(|t| !t.item_id.is_empty())
+}
+
+/// Quantos episodios a novela tem de verdade.
+///
+/// O `total` que a API declara conta o trailer, porque ele ocupa uma posicao em
+/// `online_base`. Sem descontar, uma novela de 71 episodios se anuncia com 72 e
+/// o pacote fica permanentemente "faltando o ultimo" — que foi exatamente o que
+/// aconteceu com "Como domar um coroa".
+fn total_de_episodios(total_da_api: u32, tem_trailer: bool) -> u32 {
+    total_da_api.saturating_sub(if tem_trailer { 1 } else { 0 })
+}
+
 pub async fn fetch_series(
     client: &reqwest::Client,
     lang: &str,
@@ -327,8 +352,10 @@ pub async fn fetch_series(
     }
     episodes.sort_by_key(|e| e.number);
 
-    let total = as_u64(d.get("total")) as u32;
+    let trailer = trailer_de(chapters);
+    let total = total_de_episodios(as_u64(d.get("total")) as u32, trailer.is_some());
     Ok(Series {
+        trailer,
         drama_id: book_id.to_string(),
         name: if name.is_empty() {
             format!("reelshort-{book_id}")
@@ -515,6 +542,55 @@ mod tests {
     use super::*;
 
     const BOOK: &str = "69d8612ad6461266e80b7a17";
+
+    /// Item de `online_base` como a API devolveu para "Como domar um coroa" em
+    /// 07/09/2026. E o trailer: `serial_number` 0 e `chapter_type` 2.
+    fn trailer_cru() -> Value {
+        serde_json::json!({
+            "chapter_id": "nym9omjhbi",
+            "chapter_type": 2,
+            "is_preview": 1,
+            "like_count": 6064,
+            "publish_at": 1_767_929_480_i64,
+            "serial_number": 0,
+            "status": 1,
+            "video_pic": "https://v-mps.crazymaplestudios.com/Snapshots/5a2bcabc096c137c.jpg"
+        })
+    }
+
+    #[test]
+    fn acha_o_trailer_pelo_serial_zero() {
+        let lista = vec![
+            trailer_cru(),
+            serde_json::json!({ "chapter_id": "abc", "serial_number": 1 }),
+        ];
+        let t = trailer_de(&lista).expect("trailer");
+        assert_eq!(t.item_id, "nym9omjhbi");
+        assert!(t.thumb.ends_with("5a2bcabc096c137c.jpg"));
+    }
+
+    /// Sem `serial_number` 0 nao ha trailer, e isso nao e erro: a maioria das
+    /// novelas nao tem um.
+    #[test]
+    fn novela_sem_trailer_devolve_nada() {
+        let lista = vec![serde_json::json!({ "chapter_id": "abc", "serial_number": 1 })];
+        assert!(trailer_de(&lista).is_none());
+        // Entrada de trailer sem `chapter_id` e inutil: nao da para resolver
+        // midia com ela, entao vale como ausencia.
+        let sem_id = vec![serde_json::json!({ "serial_number": 0, "video_pic": "x.jpg" })];
+        assert!(trailer_de(&sem_id).is_none());
+    }
+
+    /// O caso real: a API declarou 72 para uma novela de 71 episodios porque
+    /// contou o trailer junto.
+    #[test]
+    fn o_total_da_api_conta_o_trailer_e_precisa_descontar() {
+        assert_eq!(total_de_episodios(72, true), 71);
+        // Sem trailer nao se desconta nada.
+        assert_eq!(total_de_episodios(71, false), 71);
+        // Nao estoura para baixo se a API vier zerada.
+        assert_eq!(total_de_episodios(0, true), 0);
+    }
 
     #[test]
     fn reconhece_as_duas_formas_de_url() {

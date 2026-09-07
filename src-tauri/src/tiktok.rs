@@ -385,6 +385,8 @@ pub async fn fetch_series(
         total_duration_sec,
         upstream,
         is_limited_free,
+        // O TikTok nao publica trailer de novela: a ficha traz so os episodios.
+        trailer: None,
     })
 }
 

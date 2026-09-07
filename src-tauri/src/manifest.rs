@@ -31,6 +31,8 @@ use crate::media::{Episode, Series, Source, UA};
 pub const FILE: &str = "manifest.json";
 const POSTER_STEM: &str = "poster";
 const THUMBS_DIR: &str = "thumbs";
+/// Nome fixo do trailer na pasta. E contrato com o Noveleiras, nao preferencia.
+pub const TRAILER_FILE: &str = "trailer.mp4";
 
 /// Extensoes que valem como imagem ja baixada.
 const IMG_EXT: [&str; 4] = ["jpg", "png", "webp", "avif"];
@@ -182,6 +184,10 @@ pub struct Manifest {
     /// Caminho relativo a pasta da novela. So aparece quando o arquivo existe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poster: Option<String>,
+    /// `trailer.mp4`, relativo a pasta. Ausente quando a novela nao tem trailer
+    /// ou quando o arquivo nao foi baixado: nunca uma URL remota, que expira.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trailer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_duration_sec: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -595,6 +601,60 @@ pub fn episode_file(dir: &Path, number: u32) -> Option<String> {
     matches.into_iter().next()
 }
 
+// ---------------------------------------------------------------------- trailer
+
+/// O trailer ja baixado e valido, se houver.
+///
+/// Vale como resposta definitiva: quem tem `trailer.mp4` validado nao baixa de
+/// novo. E o que torna a segunda passagem barata e sem rede.
+pub async fn trailer_no_disco(dir: &Path) -> Option<String> {
+    let dest = dir.join(TRAILER_FILE);
+    crate::download::validate_video(&dest, false)
+        .await
+        .ok()
+        .map(|_| TRAILER_FILE.to_string())
+}
+
+/// Baixa o trailer da origem e publica `trailer.mp4` validado.
+///
+/// Reaproveita inteiro o pipeline dos episodios — `.ts` intermediario,
+/// `.parcial.mp4`, validacao profunda e rename atomico — porque o contrato do
+/// trailer e o mesmo do episodio: MP4 real, H.264/AAC, faststart. Devolve
+/// `None` quando a novela simplesmente nao tem trailer, que nao e erro.
+pub async fn ensure_trailer(
+    client: &reqwest::Client,
+    series: &Series,
+    dir: &Path,
+    sess: &crate::reelshort::Session,
+    control: crate::download::Control,
+) -> Result<Option<String>> {
+    if let Some(pronto) = trailer_no_disco(dir).await {
+        return Ok(Some(pronto));
+    }
+    let Some(trailer) = &series.trailer else {
+        return Ok(None);
+    };
+    if series.source != Source::Reelshort {
+        return Ok(None);
+    }
+    let dest = dir.join(TRAILER_FILE);
+    // `serial_number` 0 e o proprio numero do trailer na origem; a URL do
+    // episodio se monta com ele. `locked: false`: trailer e sempre aberto.
+    let (segments, _) = crate::reelshort::resolve_media(
+        client, &series.lang, &series.drama_id, 0, &trailer.item_id, false, sess,
+    )
+    .await?;
+    match crate::download::download_hls_mp4(client, &segments, &dest, "", control, |_, _| {}).await? {
+        crate::download::Outcome::Done(_) => {
+            crate::download::validate_video(&dest, true).await?;
+            Ok(Some(TRAILER_FILE.to_string()))
+        }
+        // Pausa ou cancelamento preservam o intermediario e nao mentem no
+        // manifesto: sem arquivo publicado, sem campo.
+        _ => Ok(None),
+    }
+}
+
 /// Converte/normaliza o arquivo local e devolve nome + metadados medidos.
 /// Serve tanto ao backfill quanto à sincronização após download.
 pub async fn ensure_episode_video(
@@ -677,6 +737,11 @@ pub async fn backfill_local(dir: &Path) -> Result<LocalBackfillReport> {
     let series_name = if manifest.drama_name.trim().is_empty() {
         dir.file_name().unwrap_or_default().to_string_lossy().to_string()
     } else { manifest.drama_name.clone() };
+
+    // O trailer entra no manifesto so quando ha arquivo validado no disco. Um
+    // `trailer` declarado por uma passagem anterior cujo arquivo sumiu tem de
+    // desaparecer daqui, senao o outro lado publica um botao que da 404.
+    manifest.trailer = trailer_no_disco(dir).await;
 
     // Poster legado passa a cumprir o contrato fixo `poster.jpg`.
     if crate::download::validate_jpeg(&dir.join("poster.jpg")).await.is_ok() {
@@ -787,6 +852,7 @@ mod tests {
                 comment_count: 220,
             },
             is_limited_free: true,
+            trailer: None,
         }
     }
 
@@ -1008,6 +1074,35 @@ mod tests {
         // Download em curso nao e episodio.
         assert_eq!(episode_file(&dir, 3), None);
         assert_eq!(episode_file(&dir, 9), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Trailer so conta quando e MP4 valido no disco. Um arquivo com o nome
+    /// certo mas conteudo quebrado nao vira campo no manifesto.
+    #[tokio::test]
+    async fn trailer_invalido_no_disco_nao_vira_campo() {
+        let dir = dir_de_teste("trailer-invalido");
+        assert_eq!(trailer_no_disco(&dir).await, None, "sem arquivo, sem trailer");
+
+        std::fs::write(dir.join(TRAILER_FILE), b"nao sou um mp4").unwrap();
+        assert_eq!(trailer_no_disco(&dir).await, None, "lixo com nome de mp4 nao vale");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Trailer declarado num manifesto antigo cujo arquivo sumiu tem de sair do
+    /// manifesto: senao o Noveleiras publica um botao que da 404.
+    #[tokio::test]
+    async fn backfill_apaga_trailer_declarado_que_sumiu() {
+        let dir = dir_de_teste("trailer-fantasma");
+        let mut m = Manifest { drama_name: "Novela X".into(), ..Default::default() };
+        m.trailer = Some(TRAILER_FILE.into());
+        write(&dir, &m).unwrap();
+        assert!(read(&dir).trailer.is_some(), "o manifesto de partida declara trailer");
+
+        backfill_local(&dir).await.unwrap();
+        assert_eq!(read(&dir).trailer, None, "sem arquivo no disco, o campo cai");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

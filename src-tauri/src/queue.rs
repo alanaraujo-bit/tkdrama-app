@@ -418,6 +418,7 @@ pub fn patch_manifest(
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct SyncCount {
     pub poster: bool,
+    pub trailer: bool,
     pub thumbs: usize,
     pub episodes: usize,
 }
@@ -447,6 +448,16 @@ pub async fn sync_folder(
     let poster = manifest::fetch_poster(&state.client, series, dir, &cookie, &headers).await.ok();
     count.poster = poster.is_some();
 
+    // O trailer e opcional e nunca derruba a sincronizacao: novela sem trailer
+    // e o caso normal, e uma falha de rede aqui nao pode custar o manifesto.
+    let control = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(download::RUN));
+    let trailer = manifest::ensure_trailer(
+        &state.client, series, dir, &state.rs_session(), control,
+    )
+    .await
+    .unwrap_or(None);
+    count.trailer = trailer.is_some();
+
     let mut entries: Vec<(u32, manifest::EpisodeEntry)> = Vec::new();
     for ep in &series.episodes {
         let Ok((file, info)) = manifest::ensure_episode_video(dir, &series.name, ep.number).await else {
@@ -471,6 +482,9 @@ pub async fn sync_folder(
 
     patch_manifest(state, dir, |m| {
         manifest::patch_series(m, series, poster);
+        if trailer.is_some() {
+            m.trailer = trailer;
+        }
         for (number, entry) in entries {
             manifest::patch_episode(m, number, entry);
         }

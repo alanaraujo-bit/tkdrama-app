@@ -194,6 +194,27 @@ pub struct Series {
     /// Promocao de "gratis por tempo limitado" na origem. So o TikTok declara.
     #[serde(default)]
     pub is_limited_free: bool,
+
+    /// Trailer da novela, quando a origem publica um.
+    ///
+    /// E opcional de verdade: novela sem trailer e o caso comum no TikTok, e
+    /// quem exibe a biblioteca precisa continuar funcionando sem ele.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trailer: Option<Trailer>,
+}
+
+/// O video de apresentacao da novela na origem.
+///
+/// No ReelShort ele e o capitulo de `serial_number` 0: tem `chapter_id` proprio
+/// e resolve midia pelo mesmo caminho de um episodio. Nao e episodio nenhum —
+/// nao entra na contagem, nao ganha numero e nao gera progresso de quem assiste.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Trailer {
+    /// `chapter_id` no ReelShort; o que `resolve_media` precisa.
+    pub item_id: String,
+    /// Miniatura propria do trailer, assinada e temporaria. Serve para baixar.
+    #[serde(default)]
+    pub thumb: String,
 }
 
 impl Series {
