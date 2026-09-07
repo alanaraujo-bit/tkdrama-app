@@ -1,0 +1,54 @@
+[package]
+name = "tkdrama-app"
+version = "0.1.0"
+description = "Baixa novelas verticais do TikTok"
+authors = ["Alan Araujo"]
+edition = "2021"
+
+[lib]
+# O sufixo `_lib` evita conflito com o nome do bin no Windows.
+name = "tkdrama_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rustls em vez de OpenSSL: nada de dependencia nativa para compilar.
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "gzip",
+  "brotli",
+  "deflate",
+  "stream",
+] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "fs",
+  "io-util",
+  "time",
+  "sync",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+anyhow = "1"
+
+# Espaco em disco via API do Windows: estavel e sem crate pesada.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Storage_FileSystem",
+  "Win32_Foundation",
+] }
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

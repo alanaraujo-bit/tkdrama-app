@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Sem cache do documento: numa atualizacao do app, um index.html guardado
+         apontaria para arquivos de assets que nao existem mais. -->
+    <meta http-equiv="Cache-Control" content="no-store" />
+    <title>tkdrama</title>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">tkdrama</span>
+      </div>
+
+      <div class="topbar-right">
+        <button id="auth-chip" class="chip" type="button">
+          <span class="chip-dot" aria-hidden="true"></span>
+          <span id="auth-label">verificando...</span>
+        </button>
+        <button id="auth-chip-rs" class="chip" type="button">
+          <span class="chip-dot" aria-hidden="true"></span>
+          <span id="auth-label-rs">verificando...</span>
+        </button>
+        <button id="open-settings" class="icon-btn" type="button" title="Ajustes" aria-label="Ajustes">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Z"/><path d="M19.4 13a7.9 7.9 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.9 7.9 0 0 0-1.7-1L14.9 3h-3.8l-.4 2.6a7.9 7.9 0 0 0-1.7 1l-2.4-1-2 3.4L4.6 11a7.9 7.9 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.9 7.9 0 0 0 1.7 1l.4 2.6h3.8l.4-2.6a7.9 7.9 0 0 0 1.7-1l2.4 1 2-3.4Z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Barra de busca: colar o link da novela -->
+    <section class="addbar">
+      <div class="field">
+        <svg class="field-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
+        <input
+          id="url-input"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="Cole o link da novela (TikTok ou ReelShort)"
+          aria-label="Link da novela"
+        />
+      </div>
+      <button id="fetch-btn" class="btn btn-primary" type="button">Buscar</button>
+    </section>
+
+    <div id="banner" class="banner" hidden></div>
+
+    <main class="content">
+      <!-- Painel da serie encontrada -->
+      <section id="series-panel" class="panel" hidden>
+        <div class="series-head">
+          <img id="series-cover" class="series-cover" alt="" />
+          <div class="series-meta">
+            <h2 id="series-name"></h2>
+            <p id="series-stats" class="muted"></p>
+            <p id="series-desc" class="series-desc"></p>
+          </div>
+          <button id="series-close" class="icon-btn" type="button" title="Fechar" aria-label="Fechar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+
+        <div class="series-actions">
+          <button id="download-all" class="btn btn-primary btn-lg" type="button">
+            Baixar tudo
+          </button>
+          <button id="download-sequential" class="btn btn-lg" type="button" title="Baixa um episódio de cada vez, do primeiro ao último">
+            Baixar em sequência
+          </button>
+          <button id="follow-series" class="btn btn-lg" type="button" title="Passa a verificar esta novela sozinho e baixa os episódios novos assim que saírem">
+            Acompanhar
+          </button>
+          <button id="toggle-picker" class="btn" type="button" aria-expanded="false">
+            Escolher episódios
+          </button>
+          <span id="pick-summary" class="muted pick-summary"></span>
+        </div>
+
+        <div id="picker" class="picker" hidden>
+          <div class="picker-tools">
+            <button class="link-btn" data-pick="all" type="button">Todos</button>
+            <button class="link-btn" data-pick="none" type="button">Nenhum</button>
+            <button class="link-btn" data-pick="missing" type="button">Só os que faltam</button>
+            <span class="picker-hint">clique e arraste, ou shift+clique para intervalo</span>
+          </div>
+          <div id="ep-grid" class="ep-grid"></div>
+          <div class="picker-footer">
+            <button id="download-selected" class="btn btn-primary" type="button" disabled>
+              Baixar selecionados
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Novelas acompanhadas: o app revisita sozinho e baixa o que sair -->
+      <section id="watch-panel" class="panel" hidden>
+        <div class="queue-head">
+          <h2>Acompanhando</h2>
+          <div class="queue-tools">
+            <span id="watch-next" class="muted"></span>
+            <button id="watch-now" class="btn btn-sm" type="button">Verificar agora</button>
+          </div>
+        </div>
+        <div id="watch-list" class="watch-list" role="list"></div>
+      </section>
+
+      <!-- Fila -->
+      <section class="panel queue-panel">
+        <div class="queue-head">
+          <h2>Fila</h2>
+          <div class="queue-tools">
+            <button id="pause-all" class="btn btn-sm" type="button">Pausar tudo</button>
+            <button id="resume-all" class="btn btn-sm" type="button">Retomar</button>
+            <button id="retry-failed" class="btn btn-sm" type="button">Tentar de novo</button>
+            <button id="clear-done" class="btn btn-sm" type="button">Limpar concluídos</button>
+          </div>
+        </div>
+
+        <div id="queue-empty" class="empty">
+          <p class="empty-title">A fila está vazia</p>
+          <p class="empty-hint">
+            Cole o link de uma novela do TikTok ou do ReelShort lá em cima e clique em Buscar.
+            O app encontra todos os episódios sozinho.
+          </p>
+          <p class="empty-hint">
+            Depois de buscar, use <strong>Acompanhar</strong>: o app revisita a novela de
+            tempos em tempos e baixa o episódio novo sem você colar o link de novo.
+          </p>
+        </div>
+
+        <div id="queue-list" class="queue-list" role="list"></div>
+      </section>
+    </main>
+
+    <footer class="statusbar">
+      <span id="stat-counts" class="stat"></span>
+      <span class="stat-sep" aria-hidden="true"></span>
+      <span id="stat-progress" class="stat num"></span>
+      <span id="stat-eta" class="stat num"></span>
+      <span id="stat-elapsed" class="stat num"></span>
+      <span id="stat-speed" class="stat num"></span>
+      <span class="spacer"></span>
+      <span id="stat-disk" class="stat"></span>
+      <button id="open-folder" class="link-btn" type="button">Abrir pasta</button>
+    </footer>
+
+    <!-- Ajustes -->
+    <div id="settings-modal" class="modal" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="modal-head">
+          <h2 id="settings-title">Ajustes</h2>
+          <button id="close-settings" class="icon-btn" type="button" aria-label="Fechar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+
+        <div class="modal-body">
+          <label class="setting">
+            <span class="setting-label">Pasta de destino</span>
+            <div class="setting-row">
+              <input id="set-dest" type="text" spellcheck="false" />
+              <button id="browse-dest" class="btn" type="button">Procurar</button>
+            </div>
+            <span class="setting-hint">Cada novela vira uma subpasta com o nome dela.</span>
+          </label>
+
+          <label class="check-setting">
+            <input id="set-sequential" type="checkbox" />
+            <span>
+              <strong>Baixar em sequência</strong>
+              <span class="setting-hint">Um episódio por vez, do primeiro ao último. Mais estável para filas grandes.</span>
+            </span>
+          </label>
+
+          <fieldset class="setting">
+            <legend class="setting-label">Baixar sozinho</legend>
+            <label class="check-setting">
+              <input id="set-auto" type="checkbox" />
+              <span>
+                <strong>Verificar as novelas acompanhadas de tempos em tempos</strong>
+                <span class="setting-hint">
+                  Episódio novo de novela acompanhada entra na fila sem você fazer nada.
+                  Entra com prioridade baixa: nunca passa na frente do que você pediu na mão.
+                </span>
+              </span>
+            </label>
+
+            <label class="setting">
+              <span class="setting-label">A cada quantas horas</span>
+              <div class="setting-row">
+                <input id="set-auto-interval" type="range" min="1" max="24" step="1" />
+                <output id="set-auto-interval-out" class="num"></output>
+              </div>
+              <span class="setting-hint">
+                Novela não solta episódio de hora em hora. Intervalo curto só aumenta o
+                risco de a sessão ser bloqueada — e sessão morta para o app inteiro.
+              </span>
+            </label>
+
+            <label class="setting">
+              <span class="setting-label">Máximo de novelas por rodada</span>
+              <div class="setting-row">
+                <input id="set-auto-series" type="number" min="0" max="100" step="1" />
+              </div>
+              <span class="setting-hint">0 = sem limite. Cada novela é consultada com 20s de intervalo.</span>
+            </label>
+
+            <label class="setting">
+              <span class="setting-label">Máximo de GB por rodada</span>
+              <div class="setting-row">
+                <input id="set-auto-gb" type="number" min="0" max="500" step="0.5" />
+              </div>
+              <span class="setting-hint">0 = sem limite. A rodada para ao atingir esse tanto na fila.</span>
+            </label>
+
+            <label class="setting">
+              <span class="setting-label">Não baixar abaixo de (GB livres)</span>
+              <div class="setting-row">
+                <input id="set-auto-free" type="number" min="0" max="500" step="1" />
+              </div>
+              <span class="setting-hint">Com menos espaço que isso, a rodada nem começa.</span>
+            </label>
+          </fieldset>
+
+          <label class="setting">
+            <span class="setting-label">Downloads simultâneos</span>
+            <div class="setting-row">
+              <input id="set-conc" type="range" min="1" max="3" step="1" />
+              <output id="set-conc-out" class="num"></output>
+            </div>
+            <span class="setting-hint">Até 3 mantém a fila estável. Para máxima segurança, use o modo em sequência abaixo.</span>
+          </label>
+
+          <fieldset class="setting">
+            <legend class="setting-label">Qualidade</legend>
+            <label class="radio">
+              <input type="radio" name="codec" value="h264" />
+              <span>
+                <strong>H.264 — maior qualidade real</strong>
+                <span class="setting-hint">
+                  Toca em qualquer player. É o maior bitrate disponível.
+                </span>
+              </span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="codec" value="h265" />
+              <span>
+                <strong>H.265 — quadro maior</strong>
+                <span class="setting-hint">
+                  Resolução maior, mas bitrate menor: o 1080p aqui é upscale, com
+                  menos detalhe que o 540p. Alguns players antigos não abrem.
+                </span>
+              </span>
+            </label>
+          </fieldset>
+        </div>
+
+        <div class="modal-foot">
+          <button id="save-settings" class="btn btn-primary" type="button">Salvar</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

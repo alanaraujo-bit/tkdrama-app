@@ -1,0 +1,6 @@
+cookies.txt
+cookies.txt.norm
+*.mp4
+*.part
+manifest.json
+__pycache__/
