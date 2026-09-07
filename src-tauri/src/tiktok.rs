@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use serde_json::Value;
 
-use crate::media::{Episode, Gear, Series, Source, UA};
+use crate::media::{Episode, Gear, Series, Source, Theme, Upstream, UA};
 
 const API: &str = "https://www.tiktok.com/api/drama/episode/item_list/";
 const PAGE: u32 = 24;
@@ -19,6 +19,14 @@ const MAX_PAGES: u32 = 200;
 
 pub const AUTH_HINT: &str =
     "Sessao do TikTok expirada. Abra Entrar e faca login de novo para renovar.";
+
+/// Nunca houve sessao — diferente de uma que expirou, mas o remedio e o mesmo.
+pub const NO_SESSION: &str = "Voce ainda nao entrou no TikTok. Clique em Entrar.";
+
+/// A falha e de login? Repetir nao resolve: so o usuario entrando resolve.
+pub fn is_auth_error(msg: &str) -> bool {
+    msg.contains(AUTH_HINT) || msg.contains(NO_SESSION)
+}
 
 /// Aceita URL completa (/shortdrama/episode/<id>/1), ?dramaID=<id> ou o ID puro.
 pub fn parse_drama_id(raw: &str) -> Option<String> {
@@ -112,6 +120,46 @@ fn parse_gears(video: &Value) -> Vec<Gear> {
     out
 }
 
+/// Espelhos da capa da serie, em resolucao original.
+///
+/// Le `cover.urlList` e nao `zoomCover`: o `zoomCover` e um recorte QUADRADO de
+/// 240-960 px, e a capa que se quer e a vertical da novela. O campo e um objeto,
+/// nunca uma string — le-lo como texto (o que este arquivo fazia) devolvia vazio
+/// sempre, e era por isso que nao havia capa nenhuma.
+fn parse_covers(info: &Value) -> Vec<String> {
+    info.get("cover")
+        .and_then(|c| c.get("urlList"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|u| u.as_str())
+                .filter(|s| s.starts_with("http"))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Temas da serie, crus. O `tagKey` e o identificador estavel; o `tagVal` e o
+/// rotulo em ingles da plataforma. Nenhum dos dois se traduz aqui.
+fn parse_themes(info: &Value) -> Vec<Theme> {
+    info.get("themes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| {
+                    let key = t.get("tagKey").and_then(|v| v.as_str()).unwrap_or("");
+                    let value = t.get("tagVal").and_then(|v| v.as_str()).unwrap_or("");
+                    (!key.is_empty() || !value.is_empty()).then(|| Theme {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parametros que a API espera; copiados do que o site envia.
 fn query(drama_id: &str, cursor: u32) -> Vec<(&'static str, String)> {
     vec![
@@ -198,7 +246,15 @@ pub async fn fetch_series(
     let mut by_number: std::collections::BTreeMap<u32, Episode> = Default::default();
     let mut name = String::new();
     let mut description = String::new();
-    let mut cover = String::new();
+    let mut covers: Vec<String> = Vec::new();
+    let mut themes: Vec<Theme> = Vec::new();
+    let mut total_duration_sec: u32 = 0;
+    let mut is_limited_free = false;
+    let mut upstream = Upstream::default();
+    // Numeros de audiencia sao lidos do MENOR episodio visto, nao do primeiro
+    // item da pagina: a ordem da API nao e garantida, e um numero que muda de
+    // episodio para episodio nao pode depender de qual chegou primeiro.
+    let mut stats_from: u32 = u32::MAX;
     let mut total: u32 = 0;
     let mut cursor: u32 = 0;
 
@@ -228,19 +284,32 @@ pub async fn fetch_series(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                cover = info
-                    .get("cover")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                covers = parse_covers(&info);
+                themes = parse_themes(&info);
+                total_duration_sec = as_u64(info.get("totalDuration").unwrap_or(&Value::Null)) as u32;
+                is_limited_free = info
+                    .get("isLimitedFree")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                upstream.num_watched = as_u64(info.get("numWatched").unwrap_or(&Value::Null));
             }
-            let number = info
-                .get("DramaVideoData")
-                .and_then(|d| d.get("EpisodeNumber"))
+            let dvd = info.get("DramaVideoData").cloned().unwrap_or(Value::Null);
+            let number = dvd
+                .get("EpisodeNumber")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
             if number == 0 {
                 continue;
+            }
+            // Curtidas, comentarios e reproducoes sao do ITEM, nao da serie.
+            // O episodio de menor numero e o representante estavel da novela.
+            if number < stats_from {
+                stats_from = number;
+                let stats = it.get("stats").cloned().unwrap_or(Value::Null);
+                upstream.play_count = as_u64(stats.get("playCount").unwrap_or(&Value::Null));
+                upstream.digg_count = as_u64(stats.get("diggCount").unwrap_or(&Value::Null));
+                upstream.collect_count = as_u64(stats.get("collectCount").unwrap_or(&Value::Null));
+                upstream.comment_count = as_u64(stats.get("commentCount").unwrap_or(&Value::Null));
             }
             let video = it.get("video").cloned().unwrap_or(Value::Null);
             by_number.insert(
@@ -258,6 +327,20 @@ pub async fn fetch_series(
                     // ha um campo dizendo "isto e pago".
                     locked: false,
                     lock_reason: String::new(),
+                    thumb: video
+                        .get("originCover")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    created_at: as_u64(it.get("createTime").unwrap_or(&Value::Null)),
+                    is_preview: dvd
+                        .get("IsPreview")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    is_free_intro: dvd
+                        .get("IsFreeIntro")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 },
             );
         }
@@ -293,11 +376,15 @@ pub async fn fetch_series(
         drama_id: drama_id.to_string(),
         name,
         description,
-        cover,
+        covers,
         total,
         episodes,
         source: Source::Tiktok,
         lang: String::new(),
+        themes,
+        total_duration_sec,
+        upstream,
+        is_limited_free,
     })
 }
 
@@ -350,6 +437,10 @@ mod tests {
             ],
             locked: false,
             lock_reason: String::new(),
+            thumb: String::new(),
+            created_at: 0,
+            is_preview: false,
+            is_free_intro: false,
         };
         assert_eq!(pick_gear(&ep, "h264", None).unwrap().gear_name, "normal_540_0");
         assert_eq!(
@@ -371,8 +462,119 @@ mod tests {
             gears: vec![],
             locked: false,
             lock_reason: String::new(),
+            thumb: String::new(),
+            created_at: 0,
+            is_preview: false,
+            is_free_intro: false,
         };
         assert!(pick_gear(&ep, "h264", None).is_none());
+    }
+
+    /// Fragmento real de `dramaInfo`, copiado do dump `all_eps.json`.
+    ///
+    /// Existe porque o bug que este trabalho conserta era exatamente deste
+    /// tipo: `cover` foi lido como texto durante toda a vida do app, e como e
+    /// um OBJETO o resultado era capa vazia — sem erro, sem teste quebrando,
+    /// sem ninguem perceber. Um fragmento de verdade tranca a forma.
+    fn drama_info_real() -> Value {
+        serde_json::json!({
+            "dramaID": "7677784436146164743",
+            "dramaName": "A cura mortal do bilionário",
+            "description": "Após prisão, Adeline Jenkins luta para pagar contas...",
+            "numWatched": 25638630,
+            "totalDuration": 4884,
+            "isLimitedFree": true,
+            "cover": {
+                "urlList": [
+                    "https://p16-common-sign.tiktokcdn.com/a~tplv-tiktokx-origin.image?x-expires=1",
+                    "https://p19-common-sign.tiktokcdn.com/a~tplv-tiktokx-origin.image?x-expires=1",
+                    "https://p16-common-sign.tiktokcdn.com/b~tplv-tiktokx-origin.image?x-expires=1"
+                ]
+            },
+            // Recorte quadrado de 240 px: nunca serve de capa.
+            "zoomCover": { "240": "https://p16/z~tplv-photomode-zoomcover:240:240.avif" },
+            "themes": [
+                { "tagID": "7628991193716085776",
+                  "tagKey": "tag_Contractlovers_Relationship",
+                  "tagVal": "Contract Lovers" },
+                { "tagID": "7628991193891738640",
+                  "tagKey": "tag_Marriedlife_Plot",
+                  "tagVal": "Married Life" }
+            ],
+            "DramaVideoData": {
+                "EpisodeNumber": 1,
+                "IsFreeIntro": false,
+                "IsPreview": true,
+                "IsHighlight": false
+            }
+        })
+    }
+
+    /// A capa sai de `cover.urlList`, com os tres espelhos — e nunca do
+    /// `zoomCover`, que e um recorte quadrado e nao a capa vertical da novela.
+    #[test]
+    fn a_capa_vem_do_url_list_e_nao_do_zoom_cover() {
+        let covers = parse_covers(&drama_info_real());
+        assert_eq!(covers.len(), 3, "os tres espelhos da capa precisam sobreviver");
+        assert!(covers.iter().all(|u| u.contains("tplv-tiktokx-origin")));
+        assert!(
+            !covers.iter().any(|u| u.contains("zoomcover")),
+            "o recorte quadrado nao pode virar capa"
+        );
+
+        // Um `cover` que venha como texto (a forma que este arquivo supunha)
+        // nao produz capa nenhuma — e melhor vazio que uma URL invalida.
+        let texto = serde_json::json!({ "cover": "https://p16/x.image" });
+        assert!(parse_covers(&texto).is_empty());
+        assert!(parse_covers(&Value::Null).is_empty());
+    }
+
+    /// Os temas vao crus: `tagKey` e `tagVal` viram `key` e `value`, sem
+    /// traducao. Virar genero em portugues e decisao editorial de quem exibe.
+    #[test]
+    fn temas_saem_crus_com_a_chave_estavel() {
+        let themes = parse_themes(&drama_info_real());
+        assert_eq!(themes.len(), 2);
+        assert_eq!(themes[0].key, "tag_Contractlovers_Relationship");
+        assert_eq!(themes[0].value, "Contract Lovers");
+        assert_eq!(themes[1].key, "tag_Marriedlife_Plot");
+        // Nenhum tema sem chave nem rotulo entra na lista.
+        assert!(parse_themes(&serde_json::json!({ "themes": [{}] })).is_empty());
+        assert!(parse_themes(&Value::Null).is_empty());
+    }
+
+    /// Os campos que alimentam a ficha da novela precisam continuar saindo dos
+    /// lugares certos: um deles mudar de nome la em cima e silencioso aqui.
+    #[test]
+    fn os_campos_da_ficha_saem_dos_lugares_certos() {
+        let info = drama_info_real();
+        assert_eq!(as_u64(info.get("totalDuration").unwrap()), 4884);
+        assert_eq!(as_u64(info.get("numWatched").unwrap()), 25_638_630);
+        assert_eq!(
+            info.get("isLimitedFree").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // As marcas de previa moram em DramaVideoData, junto com o numero.
+        let dvd = info.get("DramaVideoData").unwrap();
+        assert_eq!(dvd.get("IsPreview").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(dvd.get("IsFreeIntro").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(dvd.get("EpisodeNumber").and_then(|v| v.as_u64()), Some(1));
+
+        // A miniatura e do item, em `video.originCover`, e e distinta por
+        // episodio — e o dado que mais melhora a lista de quem exibe.
+        let item = serde_json::json!({
+            "id": "7677784642946174215",
+            "createTime": 1787623572u64,
+            "video": { "originCover": "https://p16/o~tplv-tiktokx-origin.image", "duration": 160 },
+            "stats": { "playCount": 384900, "diggCount": 20500,
+                       "collectCount": 6686, "commentCount": 220 }
+        });
+        assert_eq!(
+            item.pointer("/video/originCover").and_then(|v| v.as_str()),
+            Some("https://p16/o~tplv-tiktokx-origin.image")
+        );
+        assert_eq!(as_u64(item.get("createTime").unwrap()), 1_787_623_572);
+        assert_eq!(as_u64(item.pointer("/stats/playCount").unwrap()), 384_900);
     }
 
     #[test]

@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Sidecar do FFmpeg: 128 MB de binarios LGPL que o instalador empacota.
+# Ficam fora do historico; `src-tauri/binaries/README.md` diz a versao exata,
+# a origem e o SHA-256 para reproduzir a pasta antes de buildar.
+src-tauri/binaries/*
+!src-tauri/binaries/README.md

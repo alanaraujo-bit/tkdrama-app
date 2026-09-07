@@ -10,6 +10,17 @@ edition = "2021"
 name = "tkdrama_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# A CLI de manutencao mora no mesmo crate para reaproveitar o pipeline, mas
+# fica atras de uma feature: com dois bins na build padrao o `tauri build`
+# empacota o binario errado e o instalador sai sem a interface.
+[[bin]]
+name = "tkdrama-media"
+path = "src/bin/tkdrama-media.rs"
+required-features = ["cli"]
+
+[features]
+cli = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -32,6 +43,7 @@ tokio = { version = "1", features = [
   "macros",
   "fs",
   "io-util",
+  "process",
   "time",
   "sync",
 ] }

@@ -4,11 +4,13 @@
 //! permissao do app (ver capabilities/default.json, `windows: ["main"]`).
 //! Conteudo externo nunca enxerga as APIs nativas.
 
+mod backfill;
 mod disk;
-mod media;
-mod download;
+pub mod manifest;
+pub mod media;
+pub mod download;
 mod queue;
-mod reelshort;
+pub mod reelshort;
 mod tiktok;
 mod watch;
 
@@ -858,7 +860,22 @@ async fn resolve_drama_from_video(app: &AppHandle, video_id: &str) -> Res<String
 
 #[tauri::command]
 async fn fetch_series(app: AppHandle, url: String) -> Res<media::Series> {
-    load_series(&app, url).await
+    let series = load_series(&app, url).await?;
+
+    // A pasta desta novela ja existe na biblioteca? Entao esta busca acabou de
+    // revelar a identidade dela, e e a unica hora em que isso acontece: o nome
+    // da pasta nao carrega o `dramaID`, e nao ha busca por nome na API.
+    //
+    // Gravar a ficha aqui e o que resgata o que foi baixado antes de o
+    // manifesto existir. Dai em diante a pasta se identifica sozinha — o
+    // proprio `manifest.json` responde — e a varredura de metadados nao precisa
+    // mais do link.
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let dest = state.settings.lock().unwrap().dest_dir.clone();
+    if media::series_dir(&dest, &series.name).is_dir() {
+        queue::spawn_series_manifest(&state, &series, &dest);
+    }
+    Ok(series)
 }
 
 /// Corpo real do `fetch_series`, reusavel fora do comando.
@@ -916,7 +933,7 @@ pub(crate) async fn load_series(app: &AppHandle, url: String) -> Res<media::Seri
     let state = app.state::<Arc<AppState>>().inner().clone();
     let cookie = state.cookie_for(media::Source::Tiktok);
     if cookie.is_empty() {
-        return Err("Voce ainda nao entrou no TikTok. Clique em Entrar.".into());
+        return Err(tiktok::NO_SESSION.into());
     }
 
     let series = tiktok::fetch_series(&state.client, &drama_id, &cookie)
@@ -959,6 +976,10 @@ fn enqueue(
         settings.dest_dir.clone()
     };
     let added = queue::enqueue(&state, &series, &episodes, &dest, priority);
+    // A pasta acaba de nascer: e a hora de deixar nela a ficha da novela. O
+    // laco automatico tem a sua propria chamada — quem enfileira e quem grava,
+    // senao a serie reabastecida sozinha nunca ganharia manifesto.
+    queue::spawn_series_manifest(&state, &series, &dest);
     queue::save(&app);
     Ok(added)
 }
@@ -1039,6 +1060,20 @@ fn follow_set_paused(
 #[tauri::command]
 async fn watch_run_now(app: AppHandle) -> Res<watch::Report> {
     Ok(watch::run_once(&app, true).await)
+}
+
+// -------------------------------------------------------------------- metadados
+
+/// "Atualizar metadados": percorre as pastas ja baixadas e escreve a ficha de
+/// cada novela — `manifest.json`, `poster.jpg` e `thumbs/`.
+///
+/// Nenhum video e baixado. Sem este comando a melhoria so alcancaria o que for
+/// baixado de hoje em diante, e a biblioteca atual ficaria sem arte para sempre.
+#[tauri::command]
+async fn metadata_refresh(app: AppHandle) -> Res<backfill::Report> {
+    let report = backfill::run(&app).await?;
+    queue::save(&app);
+    Ok(report)
 }
 
 // ------------------------------------------------------------------------- fila
@@ -1216,6 +1251,7 @@ pub fn run() {
             follow_remove,
             follow_set_paused,
             watch_run_now,
+            metadata_refresh,
             queue_list,
             task_pause,
             task_resume,

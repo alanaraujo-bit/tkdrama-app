@@ -167,6 +167,39 @@
             <span class="setting-hint">Cada novela vira uma subpasta com o nome dela.</span>
           </label>
 
+          <!--
+            A ficha (manifest.json + capa + miniaturas) é escrita sozinha a cada
+            download. Este botão existe para o que já está no disco: sem ele, a
+            biblioteca de hoje ficaria sem arte para sempre.
+          -->
+          <div class="setting">
+            <span class="setting-label">Ficha das novelas</span>
+            <div class="setting-row">
+              <button id="meta-refresh" class="btn" type="button">Atualizar metadados</button>
+              <span id="meta-status" class="muted"></span>
+            </div>
+            <span class="setting-hint">
+              Percorre as pastas já baixadas e grava em cada uma a ficha da novela:
+              <code>manifest.json</code>, a capa e a miniatura de cada episódio.
+              Não baixa vídeo nenhum — só consulta os dados da série, com 20s entre
+              uma e outra para não derrubar a sessão.
+            </span>
+            <!--
+              O nome da pasta não carrega o ID da novela, e não existe busca por
+              nome na API. Uma pasta só se identifica se tiver ficha, ou se
+              estiver na fila ou na lista de acompanhadas. As que sobram
+              aparecem aqui: basta buscar cada uma pelo link, uma vez.
+            -->
+            <div id="meta-unresolved" class="meta-unresolved" hidden>
+              <p class="setting-hint">
+                Estas pastas o app não consegue identificar — o nome não diz qual novela é.
+                Cole o link de cada uma lá em cima e clique em <strong>Buscar</strong>:
+                isso já grava a ficha na pasta, e depois disso ela se identifica sozinha.
+              </p>
+              <ul id="meta-unresolved-list"></ul>
+            </div>
+          </div>
+
           <label class="check-setting">
             <input id="set-sequential" type="checkbox" />
             <span>

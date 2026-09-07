@@ -114,6 +114,23 @@ pub struct Episode {
     /// Explicacao curta do bloqueio, mostrada na interface.
     #[serde(default)]
     pub lock_reason: String,
+
+    /// Miniatura propria do episodio (`video.originCover` no TikTok).
+    ///
+    /// E o dado que mais melhora a lista de episodios de quem exibe, e o unico
+    /// genuinamente distinto por episodio. A URL e assinada e expira, entao ela
+    /// serve para BAIXAR o arquivo, nunca para ser gravada. O ReelShort nao tem
+    /// miniatura de capitulo: aqui fica vazio, e o outro lado cai na arte
+    /// gerada — melhor faltar do que inventar.
+    #[serde(default)]
+    pub thumb: String,
+    /// Estreia na origem, em Unix seconds. 0 = a fonte nao declara.
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub is_preview: bool,
+    #[serde(default)]
+    pub is_free_intro: bool,
 }
 
 impl Episode {
@@ -123,12 +140,41 @@ impl Episode {
     }
 }
 
+/// Um tema declarado pela origem, cru — `key` estavel, `value` como veio.
+///
+/// Nao se traduz aqui: virar genero em portugues e decisao editorial, tomada
+/// no painel de quem exibe a biblioteca, com alguem olhando.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Theme {
+    pub key: String,
+    pub value: String,
+}
+
+/// Numeros da plataforma de origem.
+///
+/// Ficam num bloco proprio porque quem exibe a biblioteca tem os proprios
+/// contadores de audiencia: misturar os dois corromperia a analise de la.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Upstream {
+    pub num_watched: u64,
+    pub play_count: u64,
+    pub digg_count: u64,
+    pub collect_count: u64,
+    pub comment_count: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Series {
     pub drama_id: String,
     pub name: String,
     pub description: String,
-    pub cover: String,
+    /// Espelhos da capa vertical, em resolucao original.
+    ///
+    /// Uma lista e nao uma URL porque o TikTok entrega tres CDNs da mesma
+    /// imagem — o mesmo padrao dos `Gear`. Todas sao assinadas e expiram: elas
+    /// servem para baixar o arquivo da capa, nunca para ser guardadas.
+    #[serde(default)]
+    pub covers: Vec<String>,
     pub total: u32,
     pub episodes: Vec<Episode>,
     #[serde(default)]
@@ -137,19 +183,40 @@ pub struct Series {
     /// dos episodios na hora de baixar.
     #[serde(default)]
     pub lang: String,
+
+    #[serde(default)]
+    pub themes: Vec<Theme>,
+    /// Duracao da serie inteira, em segundos, como a origem declara.
+    #[serde(default)]
+    pub total_duration_sec: u32,
+    #[serde(default)]
+    pub upstream: Upstream,
+    /// Promocao de "gratis por tempo limitado" na origem. So o TikTok declara.
+    #[serde(default)]
+    pub is_limited_free: bool,
 }
 
 impl Series {
+    /// URL canonica da serie, de onde ela veio.
+    ///
+    /// E o unico dado que devolve a identidade de uma pasta depois que tudo
+    /// mais se perde: o nome da pasta nao carrega o id, o `.mp4` do TikTok so
+    /// guarda o `videoID` do CDN (que nao tem caminho de volta), e a fila e a
+    /// lista de acompanhadas somem quando o usuario as limpa. Por isso ela e
+    /// gravada no manifesto, dentro da propria pasta.
+    ///
+    /// Derivada, e nao guardada, para nao existirem duas verdades: o que o
+    /// usuario colou pode ser o link de um episodio ou de um video solto.
+    pub fn url(&self) -> String {
+        series_url(self.source, &self.drama_id, &self.lang)
+    }
+
     /// Extensao do arquivo final.
     ///
-    /// O ReelShort so entrega HLS: os segmentos sao MPEG-TS e sao emendados sem
-    /// reempacotar, entao o arquivo e um `.ts` de verdade. Chamar de `.mp4` o
-    /// que nao e mp4 quebraria players que confiam na extensao.
+    /// As duas fontes terminam em MP4. No ReelShort o MPEG-TS baixado fica como
+    /// intermediario recuperavel e e remuxado sem perda antes da publicacao.
     pub fn extension(&self) -> &'static str {
-        match self.source {
-            Source::Tiktok => "mp4",
-            Source::Reelshort => "ts",
-        }
+        "mp4"
     }
 }
 
@@ -175,6 +242,32 @@ pub fn pick_gear<'a>(ep: &'a Episode, codec_pref: &str, forced: Option<&str>) ->
         preferred
     };
     pool.into_iter().max_by_key(|g| g.bitrate)
+}
+
+/// URL canonica de uma serie, a partir do que a identifica.
+///
+/// Uma definicao so, usada por quem grava o manifesto e por quem le a pasta de
+/// volta. O `lang` importa apenas no ReelShort, e ali ele importa de verdade:
+/// a pagina `/en/` e a `/pt/` sao paginas diferentes, e consultar a errada traz
+/// a novela no idioma errado sem erro nenhum.
+pub fn series_url(source: Source, drama_id: &str, lang: &str) -> String {
+    match source {
+        Source::Tiktok => format!("https://www.tiktok.com/shortdrama/episode/{drama_id}/1"),
+        Source::Reelshort => {
+            let lang = if lang.is_empty() { "pt" } else { lang };
+            format!("https://www.reelshort.com/{lang}/movie/{drama_id}")
+        }
+    }
+}
+
+/// Pasta da novela dentro da biblioteca.
+///
+/// Uma unica definicao para todo mundo: a fila grava os episodios aqui, o
+/// manifesto e a capa moram aqui, e a varredura que reconstroi os metadados do
+/// que ja foi baixado procura aqui. Duas formulas iguais mas separadas era o
+/// jeito de uma delas desviar da outra sem ninguem notar.
+pub fn series_dir(dest_dir: &str, series_name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(dest_dir).join(safe_name(series_name))
 }
 
 /// Nome de arquivo aceitavel no Windows.
@@ -220,6 +313,10 @@ mod tests {
             gears,
             locked: false,
             lock_reason: String::new(),
+            thumb: String::new(),
+            created_at: 0,
+            is_preview: false,
+            is_free_intro: false,
         }
     }
 

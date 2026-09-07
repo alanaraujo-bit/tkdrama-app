@@ -215,6 +215,10 @@ pub async fn run_once(app: &AppHandle, manual: bool) -> Report {
                 let recriados = clear_blocked(&state, series.source, &series.drama_id);
                 let numeros: Vec<u32> = series.episodes.iter().map(|e| e.number).collect();
                 let n = queue::enqueue(&state, &series, &numeros, &dest, queue::PRIO_LOW);
+                // A rodada acabou de reconsultar a API: e o momento mais barato
+                // de atualizar a ficha da novela em disco. Sem isto, so a serie
+                // enfileirada a mao ganharia manifesto.
+                queue::spawn_series_manifest(&state, &series, &dest);
                 (n.saturating_sub(recriados), None)
             }
             Err(e) => (0, Some(e)),

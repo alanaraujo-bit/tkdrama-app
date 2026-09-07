@@ -33,7 +33,13 @@ interface Series {
   drama_id: string;
   name: string;
   description: string;
-  cover: string;
+  /**
+   * Espelhos da capa, assinados e temporários.
+   *
+   * Servem para a prévia aqui na tela e para o app baixar o `poster.jpg` da
+   * pasta. Nunca são gravados: expiram em poucos dias.
+   */
+  covers: string[];
   total: number;
   episodes: Episode[];
   source: SourceName;
@@ -387,8 +393,8 @@ function renderSeries() {
   panel.hidden = false;
 
   const cover = $<HTMLImageElement>("#series-cover");
-  if (series.cover) {
-    cover.src = series.cover;
+  if (series.covers.length) {
+    cover.src = series.covers[0];
     cover.hidden = false;
   } else {
     cover.hidden = true;
@@ -577,6 +583,75 @@ async function runWatchNow() {
   } finally {
     btn.disabled = false;
     btn.textContent = "Verificar agora";
+  }
+}
+
+// -------------------------------------------------------------- metadados
+
+interface MetaReport {
+  folders: number;
+  updated: number;
+  posters: number;
+  thumbs: number;
+  episodes: number;
+  converted: number;
+  unresolved: string[];
+  errors: string[];
+}
+
+/**
+ * As pastas que a varredura não conseguiu identificar.
+ *
+ * Ficam listadas por nome porque é assim que o usuário as encontra no TikTok
+ * para colar o link. Adivinhar qual novela é cada uma seria pior que não
+ * preencher: gravaria a ficha de uma novela na pasta de outra.
+ */
+function renderUnresolved(nomes: string[]) {
+  const box = $("#meta-unresolved");
+  const list = $("#meta-unresolved-list");
+  list.textContent = "";
+  for (const nome of nomes) {
+    const li = document.createElement("li");
+    li.textContent = nome;
+    list.appendChild(li);
+  }
+  box.hidden = nomes.length === 0;
+}
+
+/**
+ * Grava a ficha das novelas que já estão no disco.
+ *
+ * A varredura é lenta de propósito — 20s entre uma novela e outra, pelo mesmo
+ * motivo do acompanhamento automático — então o botão mostra em qual pasta
+ * está, senão a janela parece travada.
+ */
+async function runMetadata() {
+  const btn = $<HTMLButtonElement>("#meta-refresh");
+  const status = $("#meta-status");
+  btn.disabled = true;
+  btn.textContent = "Atualizando...";
+  status.textContent = "";
+  try {
+    const r = await invoke<MetaReport>("metadata_refresh");
+    const partes = [
+      `${r.updated} de ${r.folders} novela(s)`,
+      `${r.posters} capa(s)`,
+      `${r.thumbs} miniatura(s)`,
+    ];
+    if (r.converted) partes.push(`${r.converted} TS convertido(s)`);
+    // Pasta sem identidade não é erro nem palpite: é trabalho que sobrou para o
+    // usuário. O banner conta quantas; a lista embaixo diz QUAIS, porque é ela
+    // que ele vai usar para buscar uma por uma.
+    if (r.unresolved.length) partes.push(`${r.unresolved.length} sem identificar`);
+    if (r.errors.length) partes.push(r.errors.join(" | "));
+    banner(partes.join(" · "), r.errors.length ? "is-error" : "is-ok");
+    status.textContent = `${r.episodes} episódio(s) com ficha`;
+    renderUnresolved(r.unresolved);
+  } catch (e) {
+    banner(String(e), "is-error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Atualizar metadados";
   }
 }
 
@@ -935,6 +1010,7 @@ function wire() {
 
   $("#follow-series").addEventListener("click", followCurrent);
   $("#watch-now").addEventListener("click", runWatchNow);
+  $("#meta-refresh").addEventListener("click", runMetadata);
   $("#set-auto-interval").addEventListener("input", (e) => {
     $("#set-auto-interval-out").textContent = `${(e.target as HTMLInputElement).value}h`;
   });
@@ -1123,6 +1199,13 @@ async function main() {
       banner(`${r.added} episódio(s) novo(s) entraram na fila sozinhos.`, "is-ok");
       refreshQueue();
     }
+  });
+
+  // A varredura de metadados espera 20s entre uma novela e outra. Sem mostrar
+  // em qual pasta esta, o botao ficaria minutos parado parecendo travado.
+  await listen<{ done: number; total: number; folder: string }>("meta://progress", (e) => {
+    const { done, total, folder } = e.payload;
+    $("#meta-status").textContent = folder ? `${done + 1}/${total} — ${folder}` : "";
   });
 
   // O backend transmite a fila enquanto algo esta rodando.

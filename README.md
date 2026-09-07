@@ -21,6 +21,13 @@ como trabalho manual, episódio por episódio.
   dispensa voltar à plataforma toda semana para colar o mesmo link.
 - **Retomada real:** downloads sobrevivem a fechar o app, queda de rede e
   desligamento. Nada recomeça do zero.
+- **Deixa a ficha da novela na pasta.** Junto dos vídeos vão um `manifest.json`,
+  a capa (`poster.jpg`) e a miniatura de cada episódio (`thumbs/E##.jpg`) — o que
+  permite a um app de biblioteca exibir o catálogo sem falar com a plataforma.
+  As URLs de imagem são assinadas e expiram, então a imagem é **baixada**, nunca
+  anotada. *Ajustes → Atualizar metadados* faz o mesmo para o que já está no
+  disco: converte `.ts` legados, normaliza MP4, gera miniaturas ausentes e
+  atualiza o manifesto sem rebaixar vídeo nenhum.
 - **Escolhe a qualidade pelo bitrate, não pela resolução** — ver abaixo.
 - Fica na bandeja do sistema: fechar a janela não interrompe a fila.
 
@@ -43,8 +50,11 @@ nunca por URL já resolvida.
   que já vem no Windows 11
 - Uma conta na plataforma de onde se vai baixar
 
-Não precisa de ffmpeg: os episódios do TikTok já vêm como MP4 único com áudio, e
-os do ReelShort são segmentos MPEG-TS emendados pelo próprio app.
+Não precisa instalar FFmpeg: o executável necessário já acompanha o app. Os
+episódios do TikTok vêm como MP4; os do ReelShort são baixados como MPEG-TS e
+remuxados sem perda para MP4. Se os codecs não forem H.264/AAC, o FFmpeg os
+converte. O arquivo só aparece como concluído após validação integral e
+`faststart`; até lá usa os sufixos `.part`/`.parcial.mp4`.
 
 ## Rodando
 
@@ -52,6 +62,11 @@ os do ReelShort são segmentos MPEG-TS emendados pelo próprio app.
 npm install
 npm run tauri dev
 ```
+
+Os binários LGPL do FFmpeg não ficam no repositório — são 128 MB e o histórico
+do Git não os perderia mais. Antes do primeiro build, preencha
+`src-tauri/binaries/` conforme o `README.md` daquela pasta, que traz a versão
+exata, a URL de origem e o SHA-256.
 
 Para gerar o instalador (NSIS, em `src-tauri/target/release/bundle/`):
 
@@ -71,6 +86,24 @@ npm run tauri build
 
 Cada novela vira uma subpasta com o nome dela, e os arquivos saem numerados
 (`Nome da novela - E01.mp4`).
+
+### Backfill e validação pela linha de comando
+
+O botão **Ajustes → Atualizar metadados** é o caminho normal. Para automação,
+a CLI usa o mesmo pipeline local (o argumento pode ser uma novela ou a raiz da
+biblioteca):
+
+```powershell
+cargo run --manifest-path src-tauri/Cargo.toml --features cli --bin tkdrama-media -- backfill "D:\Novelas"
+cargo run --manifest-path src-tauri/Cargo.toml --features cli --bin tkdrama-media -- validate "D:\Novelas\Nome da Novela"
+```
+
+Também há um comando reproduzível para baixar episódios gratuitos de uma URL
+do ReelShort sem abrir a interface (TikTok continua usando a sessão do app):
+
+```powershell
+cargo run --manifest-path src-tauri/Cargo.toml --features cli --bin tkdrama-media -- download "URL_DA_NOVELA" "D:\Novelas" 2
+```
 
 ## Limites deliberados
 
@@ -108,6 +141,8 @@ src-tauri/src/
   tiktok.rs     cliente da API de short dramas do TikTok
   reelshort.rs  cliente do ReelShort (HLS)
   media.rs      tipos comuns e escolha de qualidade
+  manifest.rs   ficha da novela em disco: manifest.json, capa, miniaturas
+  backfill.rs   varredura que dá ficha ao que já foi baixado
   disk.rs       espaço livre em disco
 tiktok-drama-dl/  protótipo anterior em Python, que originou o app
 ```

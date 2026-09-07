@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::download::{self, Control, Outcome, CANCEL, PAUSE, RUN};
+use crate::manifest::{self, Manifest};
 use crate::media::{self, Series, Source};
 use crate::reelshort;
 use crate::tiktok;
@@ -193,6 +194,14 @@ pub struct AppState {
     /// Quando a ultima rodada automatica correu. Persistido para que fechar e
     /// reabrir o app nao dispare uma rodada imediata a cada vez.
     pub last_run: Mutex<u64>,
+    /// Serializa toda gravacao de `manifest.json`.
+    ///
+    /// Ate tres episodios da MESMA novela baixam ao mesmo tempo, e cada um
+    /// termina lendo-alterando-gravando o mesmo arquivo. Sem esta trava os
+    /// perdedores da corrida sumiriam do manifesto — exatamente o buraco que a
+    /// gravacao incremental existe para tapar. Uma trava global basta: gravar o
+    /// manifesto e raro e rapido.
+    pub manifest_lock: Mutex<()>,
     pub client: reqwest::Client,
     pub seq: AtomicU64,
     pub dirty: AtomicU8,
@@ -218,6 +227,7 @@ impl AppState {
             series_cache: Mutex::new(HashMap::new()),
             follows: Mutex::new(Vec::new()),
             last_run: Mutex::new(0),
+            manifest_lock: Mutex::new(()),
             client,
             seq: AtomicU64::new(0),
             dirty: AtomicU8::new(1),
@@ -327,6 +337,7 @@ pub fn load(app: &AppHandle) {
         if !t.id.contains(':') {
             t.id = task_id(t.source, &t.drama_id, t.episode);
         }
+        migrate_reelshort_destination(t);
         if t.status == Status::Running {
             t.status = Status::Queued;
         }
@@ -336,11 +347,11 @@ pub fn load(app: &AppHandle) {
         let dest = PathBuf::from(&t.dest);
         if t.status == Status::Done {
             match std::fs::metadata(&dest) {
-                Ok(m) if t.size == 0 || m.len() == t.size => {
+                Ok(m) if download::published_mp4(&dest) => {
                     t.downloaded = m.len();
-                    if t.size == 0 {
-                        t.size = m.len();
-                    }
+                    // Depois do remux, o tamanho final pode diferir do arquivo
+                    // da origem; o MP4 validado no disco passa a ser a verdade.
+                    t.size = m.len();
                 }
                 _ => {
                     // Sumiu ou esta truncado: volta para a fila.
@@ -353,7 +364,7 @@ pub fn load(app: &AppHandle) {
             }
         }
         if t.status != Status::Done {
-            let part = std::fs::metadata(download::part_path(&dest))
+            let part = std::fs::metadata(task_part_path(t.source, &dest))
                 .map(|m| m.len())
                 .unwrap_or(0);
             t.downloaded = if t.size > 0 { part.min(t.size) } else { part };
@@ -362,6 +373,208 @@ pub fn load(app: &AppHandle) {
     *state.tasks.lock().unwrap() = tasks;
     state.seq.store(max_seq + 1, Ordering::Relaxed);
     state.mark_dirty();
+}
+
+/// Versoes anteriores publicavam o MPEG-TS como destino final. A tarefa passa
+/// a apontar para MP4, mas o arquivo antigo permanece exatamente no caminho que
+/// o novo remux usa como entrada — logo a migracao nao repete download algum.
+fn migrate_reelshort_destination(task: &mut Task) {
+    let dest = PathBuf::from(&task.dest);
+    if task.source == Source::Reelshort
+        && dest
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+    {
+        task.dest = dest.with_extension("mp4").to_string_lossy().to_string();
+    }
+}
+
+fn task_part_path(source: Source, dest: &std::path::Path) -> PathBuf {
+    if source == Source::Reelshort {
+        download::part_path(&download::hls_source_path(dest))
+    } else {
+        download::part_path(dest)
+    }
+}
+
+// -------------------------------------------------------------------- manifesto
+
+/// Le, altera e grava o manifesto de uma pasta sob a trava global.
+///
+/// Nada de `await` aqui dentro: o que precisa de rede (baixar capa e miniatura)
+/// acontece antes, e so o trecho de disco entra na regiao critica.
+pub fn patch_manifest(
+    state: &AppState,
+    dir: &std::path::Path,
+    apply: impl FnOnce(&mut Manifest),
+) -> anyhow::Result<()> {
+    let _guard = state.manifest_lock.lock().unwrap();
+    let mut m = manifest::read(dir);
+    apply(&mut m);
+    manifest::write(dir, &m)
+}
+
+/// O que uma passagem de metadados deixou na pasta.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct SyncCount {
+    pub poster: bool,
+    pub thumbs: usize,
+    pub episodes: usize,
+}
+
+/// Grava na pasta da novela tudo o que se sabe dela: `manifest.json`,
+/// `poster.jpg` e `thumbs/E##.jpg`.
+///
+/// Um episodio so entra se o arquivo de video existe no disco: o manifesto
+/// descreve a pasta, nao a fila. Por isso a mesma funcao serve ao download
+/// (onde ela vai preenchendo conforme os arquivos aparecem) e a varredura do
+/// que ja foi baixado.
+///
+/// As imagens sao baixadas ANTES da regiao critica; so o trecho de disco entra
+/// na trava.
+pub async fn sync_folder(
+    state: &Arc<AppState>,
+    series: &Series,
+    dir: &std::path::Path,
+) -> anyhow::Result<SyncCount> {
+    let mut count = SyncCount::default();
+    let (cookie, headers) = if series.source == Source::Reelshort {
+        let session = state.rs_session();
+        (session.cookie, session.headers)
+    } else {
+        (state.cookie_for(series.source), Vec::new())
+    };
+    let poster = manifest::fetch_poster(&state.client, series, dir, &cookie, &headers).await.ok();
+    count.poster = poster.is_some();
+
+    let mut entries: Vec<(u32, manifest::EpisodeEntry)> = Vec::new();
+    for ep in &series.episodes {
+        let Ok((file, info)) = manifest::ensure_episode_video(dir, &series.name, ep.number).await else {
+            continue;
+        };
+        let video = dir.join(&file);
+        let remote_thumb = manifest::fetch_thumb(
+            &state.client, series.source, &ep.thumb, dir, ep.number, &cookie, &headers,
+        )
+            .await
+            .ok();
+        let thumb = match remote_thumb {
+            Some(path) => manifest::ensure_video_thumb(&video, dir, ep.number).await.ok().or(Some(path)),
+            None => manifest::ensure_video_thumb(&video, dir, ep.number).await.ok(),
+        };
+        if thumb.is_some() {
+            count.thumbs += 1;
+        }
+        entries.push((ep.number, manifest::validated_episode_entry(Some(ep), file, thumb, &info)));
+    }
+    count.episodes = entries.len();
+
+    patch_manifest(state, dir, |m| {
+        manifest::patch_series(m, series, poster);
+        for (number, entry) in entries {
+            manifest::patch_episode(m, number, entry);
+        }
+    })?;
+    Ok(count)
+}
+
+/// Dispara `sync_folder` em segundo plano, para quem nao pode esperar por rede.
+///
+/// Falhar aqui nunca atrapalha a fila: o manifesto e conveniencia para quem
+/// exibe a biblioteca, e a proxima passagem (o fim de um episodio, ou a
+/// varredura de metadados) refaz o trabalho.
+pub fn spawn_series_manifest(state: &Arc<AppState>, series: &Series, dest_dir: &str) {
+    let state = state.clone();
+    let series = series.clone();
+    let dir = media::series_dir(dest_dir, &series.name);
+    tauri::async_runtime::spawn(async move {
+        let _ = sync_folder(&state, &series, &dir).await;
+    });
+}
+
+/// Atualiza o manifesto com um episodio que acabou de ficar pronto.
+///
+/// E o que garante que uma fila interrompida no episodio 20 deixe um manifesto
+/// com 20 episodios, e nao nenhum. Quando a serie ainda esta em cache, aproveita
+/// para baixar a miniatura; quando nao esta (app reaberto no meio da fila),
+/// grava o que a propria tarefa sabe e deixa o resto para a varredura.
+fn spawn_episode_manifest(state: &Arc<AppState>, id: &str) {
+    let Some(task) = state.tasks.lock().unwrap().iter().find(|t| t.id == id).cloned() else {
+        return;
+    };
+    let dest = PathBuf::from(&task.dest);
+    let (Some(dir), Some(file)) = (
+        dest.parent().map(|p| p.to_path_buf()),
+        dest.file_name().map(|f| f.to_string_lossy().to_string()),
+    ) else {
+        return;
+    };
+    let episode = state
+        .series_cache
+        .lock()
+        .unwrap()
+        .get(&task.source.cache_key(&task.drama_id))
+        .and_then(|s| s.episodes.iter().find(|e| e.number == task.episode).cloned());
+
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let entry = match episode {
+            Some(ep) => {
+                let (cookie, headers) = if task.source == Source::Reelshort {
+                    let session = state.rs_session();
+                    (session.cookie, session.headers)
+                } else { (state.cookie_for(task.source), Vec::new()) };
+                let thumb = manifest::fetch_thumb(
+                    &state.client,
+                    task.source,
+                    &ep.thumb,
+                    &dir,
+                    task.episode,
+                    &cookie,
+                    &headers,
+                )
+                .await
+                .ok();
+                let info = download::validate_video(&dest, false).await.ok();
+                let thumb = match thumb {
+                    Some(path) => manifest::ensure_video_thumb(&dest, &dir, task.episode).await.ok().or(Some(path)),
+                    None => manifest::ensure_video_thumb(&dest, &dir, task.episode).await.ok(),
+                };
+                match info {
+                    Some(info) => manifest::validated_episode_entry(Some(&ep), file, thumb, &info),
+                    None => return,
+                }
+            }
+            // Sem a serie em cache, o que se afirma e so o que o download viu.
+            // Os campos ausentes ficam ausentes: o merge preserva o que uma
+            // passagem anterior ja tenha gravado.
+            None => match download::validate_video(&dest, false).await {
+                Ok(info) => manifest::validated_episode_entry(
+                    None, file, manifest::ensure_video_thumb(&dest, &dir, task.episode).await.ok(), &info,
+                ),
+                Err(_) => return,
+            },
+        };
+        let _ = patch_manifest(&state, &dir, |m| {
+            manifest::patch_episode(m, task.episode, entry);
+            if m.captured_at.is_empty() {
+                m.captured_at = manifest::now_iso();
+            }
+            if m.drama_name.is_empty() {
+                m.drama_name = task.series.clone();
+            }
+            if m.drama_id.is_empty() {
+                m.drama_id = task.drama_id.clone();
+            }
+            if m.source.is_empty() {
+                m.source = match task.source {
+                    Source::Tiktok => "tiktok",
+                    Source::Reelshort => "reelshort",
+                }
+                .into();
+            }
+        });
+    });
 }
 
 // -------------------------------------------------------------------- agendador
@@ -566,7 +779,12 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
             tasks
                 .iter()
                 .find(|t| t.id == id)
-                .map(|t| t.urls.is_empty())
+                .map(|t| {
+                    let dest = PathBuf::from(&t.dest);
+                    let local_hls = t.source == Source::Reelshort
+                        && download::nonempty(&download::hls_source_path(&dest));
+                    t.urls.is_empty() && !local_hls
+                })
                 .unwrap_or(true)
         };
         if needs_urls {
@@ -612,7 +830,9 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
             )
         };
 
-        if gear.urls.is_empty() {
+        let local_hls = source == Source::Reelshort
+            && download::nonempty(&download::hls_source_path(&dest));
+        if gear.urls.is_empty() && !local_hls {
             finish(&state, &id, Status::Blocked, Some("sem midia acessivel".into()));
             return;
         }
@@ -662,7 +882,7 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
         let result = match source {
             Source::Reelshort => {
                 let rs_cookie = state.cookie_for(Source::Reelshort);
-                download::download_hls(
+                download::download_hls_mp4(
                     &state.client,
                     &gear.urls,
                     &dest,
@@ -697,6 +917,8 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
                     }
                 }
                 finish(&state, &id, Status::Done, None);
+                // O arquivo existe: agora ele pode entrar no manifesto.
+                spawn_episode_manifest(&state, &id);
             }
             Ok(Outcome::Paused) => finish(&state, &id, Status::Paused, None),
             Ok(Outcome::Canceled) => {
@@ -729,7 +951,13 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
                     || msg.contains("404")
                     || msg.contains("tamanho inesperado");
                 let reason = friendly(&msg);
-                if !schedule_retry(&state, &id, &reason, stale) {
+                // Falha estrutural do remux nao melhora repetindo a mesma
+                // entrada seis vezes. O TS fica preservado para diagnostico e
+                // para uma retomada depois de reinstalar/corrigir o aplicativo.
+                let fatal_remux = msg.contains("FFmpeg")
+                    || msg.contains("converter o episodio para MP4")
+                    || msg.contains("MP4 vazio");
+                if fatal_remux || !schedule_retry(&state, &id, &reason, stale) {
                     finish(&state, &id, Status::Failed, Some(reason));
                 }
             }
@@ -756,7 +984,7 @@ fn finish(state: &Arc<AppState>, id: &str, status: Status, error: Option<String>
 /// Sessao morta. Nao adianta insistir: repetir seis vezes com espera so atrasa
 /// a unica coisa que resolve, que e o usuario entrar no TikTok de novo.
 fn is_auth_error(msg: &str) -> bool {
-    msg.contains(tiktok::AUTH_HINT)
+    tiktok::is_auth_error(msg)
 }
 
 /// Traduz o erro cru (dump de HTTP, erro do reqwest) para uma frase curta que
@@ -783,6 +1011,10 @@ fn friendly(msg: &str) -> String {
         "o episodio saiu do ar"
     } else if m.contains("sem midia acessivel") {
         "precisa ser desbloqueado no TikTok"
+    } else if m.contains("ffmpeg nao foi encontrado") {
+        "instalacao incompleta — reinstale o tkdrama"
+    } else if m.contains("converter o episodio para mp4") || m.contains("mp4 vazio") {
+        "nao consegui preparar o MP4"
     } else {
         "falha de rede"
     }
@@ -849,7 +1081,11 @@ pub fn enqueue(
         (s.codec.clone(), s.gear.clone())
     };
     let safe = media::safe_name(&series.name);
-    let dir = PathBuf::from(dest_dir).join(&safe);
+    // Uma unica definicao da pasta da novela, compartilhada com quem grava o
+    // manifesto e com a varredura: a formula repetida era o jeito de uma copia
+    // desviar da outra sem ninguem notar. `safe` segue servindo ao NOME do
+    // arquivo, que e outra coisa.
+    let dir = media::series_dir(dest_dir, &series.name);
     let ext = series.extension();
     let mut added = 0;
 
@@ -870,11 +1106,7 @@ pub fn enqueue(
 
         // No ReelShort o tamanho so se conhece baixando, entao "ja tenho" nao
         // pode ser por tamanho: vale o arquivo final existir com conteudo.
-        let have_file = if size > 0 {
-            download::already_complete(&dest, size)
-        } else {
-            std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) > 0
-        };
+        let have_file = download::published_mp4(&dest);
 
         let (status, error) = if !ep.available() {
             // Episodio pago entra na lista para o usuario ver que existe, mas
@@ -903,7 +1135,7 @@ pub fn enqueue(
             }
             actual
         } else {
-            let part = std::fs::metadata(download::part_path(&dest))
+            let part = std::fs::metadata(task_part_path(series.source, &dest))
                 .map(|m| m.len())
                 .unwrap_or(0);
             // Um .part maior que o esperado e lixo: nao pode virar 110% na barra.
@@ -1000,7 +1232,10 @@ pub fn cancel(state: &Arc<AppState>, id: &str, delete_file: bool) {
     state.control_for(id).store(CANCEL, Ordering::Relaxed);
     let dest = {
         let tasks = state.tasks.lock().unwrap();
-        tasks.iter().find(|t| t.id == id).map(|t| t.dest.clone())
+        tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| (t.source, t.dest.clone()))
     };
     let was_running = {
         let tasks = state.tasks.lock().unwrap();
@@ -1016,11 +1251,15 @@ pub fn cancel(state: &Arc<AppState>, id: &str, delete_file: bool) {
         state.controls.lock().unwrap().remove(id);
     }
     if delete_file {
-        if let Some(d) = dest {
+        if let Some((source, d)) = dest {
             let p = PathBuf::from(&d);
             // Inclui a anotacao de retomada do HLS: deixar o .idx para tras
             // sujaria a pasta com lixo de um download que nao existe mais.
-            download::remove_artifacts(&p);
+            if source == Source::Reelshort {
+                download::remove_hls_mp4_artifacts(&p);
+            } else {
+                download::remove_artifacts(&p);
+            }
             let _ = std::fs::remove_file(&p);
         }
     }
@@ -1202,6 +1441,21 @@ mod tests {
         assert_ne!(novo, task_id(Source::Reelshort, "7677784436146164743", 3));
     }
 
+    /// A atualizacao nao pode abandonar nem baixar novamente um `.ts` que uma
+    /// versao anterior ja terminou; ele vira a entrada local do remux.
+    #[test]
+    fn tarefa_antiga_do_reelshort_migra_o_destino_para_mp4() {
+        let mut t = task("rs:d-1", Status::Done, PRIO_NORMAL, 1);
+        t.source = Source::Reelshort;
+        t.dest = "D:/novela/Novela - E01.ts".into();
+        migrate_reelshort_destination(&mut t);
+        assert_eq!(t.dest, "D:/novela/Novela - E01.mp4");
+        assert_eq!(
+            download::hls_source_path(PathBuf::from(&t.dest).as_path()),
+            PathBuf::from("D:/novela/Novela - E01.ts")
+        );
+    }
+
     #[test]
     fn tarefa_em_backoff_nao_e_escolhida_antes_da_hora() {
         let state = Arc::new(AppState::new());
@@ -1292,6 +1546,10 @@ mod tests {
         assert!(is_auth_error(&auth));
         assert_eq!(friendly(&auth), "a sessao do TikTok expirou — clique em Entrar");
         assert_eq!(friendly("tamanho inesperado (10 != 20)"), "o link mudou de versao");
+        assert_eq!(
+            friendly("nao consegui converter o episodio para MP4: invalid data"),
+            "nao consegui preparar o MP4"
+        );
         // O que nao se reconhece ainda sai legivel, nunca como dump.
         assert_eq!(friendly("algo muito estranho"), "falha de rede");
     }

@@ -844,6 +844,27 @@ svg {
   font-weight: 400;
 }
 
+/* Pastas que a varredura nao conseguiu identificar: e uma lista de trabalho,
+   nao um aviso de erro. Fica discreta, mas legivel por inteiro — o usuario
+   precisa ler cada nome para achar a novela na plataforma. */
+.meta-unresolved {
+  margin-top: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.meta-unresolved ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.meta-unresolved li {
+  padding: 1px 0;
+}
+
 .check-setting {
   display: flex;
   gap: 9px;

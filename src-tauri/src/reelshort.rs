@@ -285,6 +285,14 @@ pub async fn fetch_series(
         episodes.push(Episode {
             number,
             item_id: chapter_id,
+            // A lista de capitulos do ReelShort nao traz miniatura nem data de
+            // estreia: `getChapterList` devolve `serial_number` e `chapter_id`,
+            // e nada mais. Sem miniatura, quem exibe cai na arte gerada — que e
+            // melhor que uma inventada.
+            thumb: String::new(),
+            created_at: 0,
+            is_preview: false,
+            is_free_intro: false,
             // A duracao real so vem na pagina do episodio; resolvida ao baixar.
             duration: 0,
             // Variante sintetica: as URLs dos segmentos chegam depois, em
@@ -328,11 +336,24 @@ pub async fn fetch_series(
             name
         },
         description: as_str(d.get("special_desc")),
-        cover: as_str(d.get("book_pic")),
+        covers: {
+            let pic = as_str(d.get("book_pic"));
+            if pic.is_empty() {
+                Vec::new()
+            } else {
+                vec![pic]
+            }
+        },
         total: if total > 0 { total } else { episodes.len() as u32 },
         episodes,
         source: Source::Reelshort,
         lang: lang.to_string(),
+        // O ReelShort nao publica temas, duracao total nem contadores de
+        // audiencia na pagina da serie. Ficam vazios, e o manifesto os omite.
+        themes: Vec::new(),
+        total_duration_sec: 0,
+        upstream: Default::default(),
+        is_limited_free: false,
     })
 }
 
