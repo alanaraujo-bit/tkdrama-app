@@ -50,7 +50,8 @@ D:\Novelas\A cura mortal do bilionário\
 
 ### `poster.jpg`
 
-De `dramaInfo.cover.urlList[0]` (TikTok) ou `book_pic` (ReelShort).
+De `dramaInfo.cover.urlList[0]` (TikTok), `book_pic` (ReelShort) ou a meta tag
+`og:image` da página da série (CandyJar).
 
 Use `cover.urlList`, **não** `zoomCover`: o `zoomCover` é um recorte quadrado
 de 240–960 px, e a capa do app é vertical (720×1080). O `urlList` traz a
@@ -62,7 +63,20 @@ De `video.originCover` de cada episódio. Este é o dado que mais melhora a list
 de episódios, e é genuinamente distinto por episódio.
 
 No ReelShort a lista de capítulos não traz miniatura — nesse caso, sem
-`thumbs/`, e o app cai na arte gerada. Melhor faltar do que inventar.
+`thumbs/`, e o app cai na arte gerada. Melhor faltar do que inventar. O
+CandyJar traz `posterUrl`/`verticalPosterUrl` por episódio, então ali
+`thumbs/` é gravado normalmente.
+
+### `trailer.mp4`
+
+Quando a origem publica um vídeo de apresentação da novela, ele é gravado
+como `trailer.mp4`, na raiz da pasta, junto dos episódios — mesmo pipeline de
+download e validação (MP4 real, H.264/AAC, faststart). Não é episódio: não
+tem número, não entra em `totalEpisodes` nem em `episodes`.
+
+Hoje o ReelShort e o CandyJar publicam trailer (é o item de número/`serial
+number` 0 na listagem, marcado como tal); o TikTok não. Novela sem trailer é
+o caso comum — o campo fica ausente, nunca `null` nem inventado.
 
 ### `manifest.json`
 
@@ -78,9 +92,10 @@ exatamente assim — o resto é aditivo:
   "totalEpisodes": 40,
 
   // --- novo: nível da novela ---
-  "source": "tiktok",                    // "tiktok" | "reelshort"
+  "source": "tiktok",                    // "tiktok" | "reelshort" | "candyjar"
   "description": "Após prisão, Adeline Jenkins luta para pagar contas...",
   "poster": "poster.jpg",                // caminho relativo à pasta da novela
+  "trailer": "trailer.mp4",              // ausente quando a novela não tem
   "totalDurationSec": 4884,
   "themes": [                            // dramaInfo.themes, cru
     { "key": "tag_Contractlovers_Relationship", "value": "Contract Lovers" },

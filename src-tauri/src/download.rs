@@ -685,6 +685,100 @@ pub async fn download_hls_mp4(
     }
 }
 
+/// Baixa e junta um episodio do CandyJar: FFmpeg recebe a(s) playlist(s) HLS
+/// diretamente e faz o mux, sem passar por Rust. Video e audio costumam vir
+/// em faixas separadas (fMP4/CMAF); quando nao vem (conteudo antigo, ver
+/// `candyjar::select_variant`), uma unica entrada carrega os dois.
+///
+/// Diferente do ReelShort, aqui nao ha retomada por byte: cada tentativa reinicia
+/// do zero. O motivo e o formato — segmentos fMP4 dependem de um `init.mp4`
+/// (`EXT-X-MAP`) que uma leitura manual de segmentos poderia descartar em
+/// silencio (ver o modulo `candyjar`), entao o FFmpeg cuida da playlist
+/// inteira de uma vez, e uma pausa/queda no meio perde o que foi baixado ate
+/// ali. Episodios sao curtos (poucos minutos): o custo de recomecar e baixo.
+pub async fn download_candyjar_mp4(
+    video_url: &str,
+    // `None` quando a variante ja carrega audio embutido (conteudo antigo,
+    // MPEG-TS classico — ver `candyjar::select_variant`); nesse caso uma
+    // entrada so basta e os dois mapas apontam para ela.
+    audio_url: Option<&str>,
+    dest: &Path,
+    control: Control,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<Outcome> {
+    if video_url.is_empty() {
+        bail!("episodio sem URL de midia (bloqueado)");
+    }
+    if validate_video(dest, false).await.is_ok() {
+        return Ok(Outcome::Done(std::fs::metadata(dest)?.len()));
+    }
+
+    let tmp = video_part_path(dest);
+    let _ = tokio::fs::remove_file(&tmp).await;
+    if let Some(dir) = tmp.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+
+    let mut cmd = tokio::process::Command::new(ffmpeg_path()?);
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .arg("-hide_banner").arg("-loglevel").arg("error").arg("-nostdin").arg("-y")
+        .arg("-i").arg(video_url);
+    let audio_map = match audio_url {
+        Some(url) => {
+            cmd.arg("-i").arg(url);
+            "1:a:0"
+        }
+        None => "0:a:0",
+    };
+    cmd.arg("-map").arg("0:v:0").arg("-map").arg(audio_map)
+        .arg("-c:v").arg("copy").arg("-c:a").arg("copy")
+        .arg("-movflags").arg("+faststart")
+        .arg(&tmp);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.as_std_mut().creation_flags(0x0800_0000);
+    }
+    let mut child = cmd.spawn().context("não consegui executar o FFmpeg empacotado")?;
+
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status?;
+                if !status.success() {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    bail!("não consegui baixar o episódio do CandyJar");
+                }
+                break;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+                let out = match control.load(Ordering::Relaxed) {
+                    PAUSE => Some(Outcome::Paused),
+                    CANCEL => Some(Outcome::Canceled),
+                    _ => None,
+                };
+                if let Some(out) = out {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Ok(out);
+                }
+                let size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+                on_progress(size, 0);
+            }
+        }
+    }
+
+    validate_video(&tmp, true).await.map_err(|e| { let _ = std::fs::remove_file(&tmp); e })?;
+    if dest.exists() { tokio::fs::remove_file(dest).await?; }
+    tokio::fs::rename(&tmp, dest).await?;
+    let size = std::fs::metadata(dest)?.len();
+    on_progress(size, size);
+    Ok(Outcome::Done(size))
+}
+
 /// Remove tanto a saida final quanto todos os intermediarios do ReelShort.
 pub fn remove_hls_mp4_artifacts(dest: &Path) {
     let input = hls_source_path(dest);

@@ -5,6 +5,7 @@
 //! Conteudo externo nunca enxerga as APIs nativas.
 
 mod backfill;
+pub mod candyjar;
 mod disk;
 pub mod manifest;
 pub mod media;
@@ -916,6 +917,24 @@ pub(crate) async fn load_series(app: &AppHandle, url: String) -> Res<media::Seri
         return Ok(series);
     }
 
+    // CandyJar: o portao de direito e por sessao, mas so por cookie — a
+    // pagina e renderizada no servidor lendo os cookies da requisicao, sem o
+    // cabecalho extra que o ReelShort exige. Basta a sessao ja capturada.
+    if let Some((lang, id)) = candyjar::parse_url(&url) {
+        refresh_cookie(app, media::Source::Candyjar).await;
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        let cookie = state.cookie_for(media::Source::Candyjar);
+        let series = candyjar::fetch_series(&state.client, &lang, &id, &cookie)
+            .await
+            .map_err(|e| e.to_string())?;
+        state
+            .series_cache
+            .lock()
+            .unwrap()
+            .insert(series.source.cache_key(&series.drama_id), series.clone());
+        return Ok(series);
+    }
+
     // URL direta da serie tem prioridade; senao, resolve a partir do video.
     let drama_id = match tiktok::parse_drama_id(&url) {
         Some(id) => id,
@@ -923,7 +942,7 @@ pub(crate) async fn load_series(app: &AppHandle, url: String) -> Res<media::Seri
             Some(vid) => resolve_drama_from_video(app, &vid).await?,
             None => {
                 return Err("Nao reconheci essa URL. Cole o link de uma novela ou de um \
-                            episodio do TikTok."
+                            episodio do TikTok, do ReelShort ou do CandyJar."
                     .to_string())
             }
         },

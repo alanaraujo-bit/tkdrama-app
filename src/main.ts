@@ -17,7 +17,7 @@ interface Gear {
   urls: string[];
 }
 
-type SourceName = "tiktok" | "reelshort";
+type SourceName = "tiktok" | "reelshort" | "candyjar";
 
 interface Episode {
   number: number;
@@ -47,7 +47,14 @@ interface Series {
 }
 
 /** Espelha `Source::tag()` em media.rs — o id da tarefa leva a fonte no prefixo. */
-const SOURCE_TAG: Record<string, string> = { tiktok: "tk", reelshort: "rs" };
+const SOURCE_TAG: Record<string, string> = { tiktok: "tk", reelshort: "rs", candyjar: "cj" };
+
+/** Espelha `Source::label()` em media.rs — usado so para textos da tela. */
+const SOURCE_LABEL: Record<string, string> = {
+  tiktok: "TikTok",
+  reelshort: "ReelShort",
+  candyjar: "CandyJar",
+};
 
 function taskId(source: string, dramaId: string, episode: number): string {
   return `${SOURCE_TAG[source] ?? "tk"}:${dramaId}-${episode}`;
@@ -251,6 +258,7 @@ async function refreshAuth() {
   const chips: Array<[string, string, string]> = [
     ["tk", "#auth-chip", "#auth-label"],
     ["rs", "#auth-chip-rs", "#auth-label-rs"],
+    ["cj", "#auth-chip-cj", "#auth-label-cj"],
   ];
   try {
     const r = await invoke<Record<string, AuthEntry>>("auth_status");
@@ -349,7 +357,7 @@ async function saveSettings() {
 async function fetchSeries() {
   const url = $<HTMLInputElement>("#url-input").value.trim();
   if (!url) {
-    banner("Cole o link de uma novela do TikTok ou do ReelShort primeiro.", "is-error");
+    banner("Cole o link de uma novela do TikTok, do ReelShort ou do CandyJar primeiro.", "is-error");
     return;
   }
   const btn = $<HTMLButtonElement>("#fetch-btn");
@@ -362,13 +370,15 @@ async function fetchSeries() {
     seriesUrl = url;
     selected = new Set();
     renderSeries();
-    // O portão de direito do ReelShort depende da credencial da janela logada.
-    // Se sobrou episódio trancado, o motivo mais provável é ela não ter sido
-    // capturada — dizer isso é melhor do que deixar o usuário no escuro.
-    if (series.source === "reelshort" && series.episodes.some((e) => e.locked)) {
+    // O portão de direito do ReelShort e do CandyJar depende da sessão da
+    // janela logada. Se sobrou episódio trancado, o motivo mais provável é
+    // ela não ter sido capturada — dizer isso é melhor do que deixar o
+    // usuário no escuro.
+    if (series.source !== "tiktok" && series.episodes.some((e) => e.locked)) {
       const n = series.episodes.filter((e) => e.locked).length;
+      const label = SOURCE_LABEL[series.source] ?? series.source;
       banner(
-        `${n} episódio(s) ainda trancados. Se a sua conta libera eles, mantenha a janela do ReelShort aberta e logada (chip lá em cima) e clique em Buscar de novo.`,
+        `${n} episódio(s) ainda trancados. Se a sua conta libera eles, mantenha a janela do ${label} aberta e logada (chip lá em cima) e clique em Buscar de novo.`,
       );
     }
   } catch (e) {
@@ -509,7 +519,7 @@ function renderFollows() {
     const novos = f.last_added > 0 ? ` · ${f.last_added} novo(s) na última` : "";
     sub.textContent = f.error
       ? `${f.error}`
-      : `${f.source === "reelshort" ? "ReelShort" : "TikTok"} · ${quando}${novos}`;
+      : `${SOURCE_LABEL[f.source] ?? "TikTok"} · ${quando}${novos}`;
     if (f.error) sub.classList.add("is-error-text");
     info.append(nome, sub);
 
@@ -992,6 +1002,10 @@ function wire() {
   $("#auth-chip-rs").addEventListener("click", async () => {
     await invoke("open_login", { source: "reelshort" });
     banner("Entre na sua conta do ReelShort na janela que abriu, depois volte aqui.");
+  });
+  $("#auth-chip-cj").addEventListener("click", async () => {
+    await invoke("open_login", { source: "candyjar" });
+    banner("Entre na sua conta do CandyJar na janela que abriu, depois volte aqui.");
   });
 
   $("#series-close").addEventListener("click", () => {

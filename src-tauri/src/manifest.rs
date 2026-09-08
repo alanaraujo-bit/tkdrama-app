@@ -387,6 +387,7 @@ fn referer(source: Source) -> &'static str {
     match source {
         Source::Tiktok => "https://www.tiktok.com/",
         Source::Reelshort => "https://www.reelshort.com/",
+        Source::Candyjar => "https://candyjar.com/",
     }
 }
 
@@ -480,6 +481,7 @@ pub fn patch_series(m: &mut Manifest, s: &Series, poster: Option<String>) {
     m.source = match s.source {
         Source::Tiktok => "tiktok",
         Source::Reelshort => "reelshort",
+        Source::Candyjar => "candyjar",
     }
     .into();
     m.source_url = s.url();
@@ -617,15 +619,19 @@ pub async fn trailer_no_disco(dir: &Path) -> Option<String> {
 
 /// Baixa o trailer da origem e publica `trailer.mp4` validado.
 ///
-/// Reaproveita inteiro o pipeline dos episodios — `.ts` intermediario,
-/// `.parcial.mp4`, validacao profunda e rename atomico — porque o contrato do
-/// trailer e o mesmo do episodio: MP4 real, H.264/AAC, faststart. Devolve
-/// `None` quando a novela simplesmente nao tem trailer, que nao e erro.
+/// Reaproveita inteiro o pipeline dos episodios — intermediario, validacao
+/// profunda e rename atomico — porque o contrato do trailer e o mesmo do
+/// episodio: MP4 real, H.264/AAC, faststart. Devolve `None` quando a novela
+/// simplesmente nao tem trailer, que nao e erro.
+///
+/// `cj_cookie` so importa para o CandyJar (sessao usada ao resolver a midia);
+/// as outras fontes ignoram o parametro.
 pub async fn ensure_trailer(
     client: &reqwest::Client,
     series: &Series,
     dir: &Path,
     sess: &crate::reelshort::Session,
+    cj_cookie: &str,
     control: crate::download::Control,
 ) -> Result<Option<String>> {
     if let Some(pronto) = trailer_no_disco(dir).await {
@@ -634,17 +640,33 @@ pub async fn ensure_trailer(
     let Some(trailer) = &series.trailer else {
         return Ok(None);
     };
-    if series.source != Source::Reelshort {
-        return Ok(None);
-    }
     let dest = dir.join(TRAILER_FILE);
-    // `serial_number` 0 e o proprio numero do trailer na origem; a URL do
-    // episodio se monta com ele. `locked: false`: trailer e sempre aberto.
-    let (segments, _) = crate::reelshort::resolve_media(
-        client, &series.lang, &series.drama_id, 0, &trailer.item_id, false, sess,
-    )
-    .await?;
-    match crate::download::download_hls_mp4(client, &segments, &dest, "", control, |_, _| {}).await? {
+
+    // `serial_number`/`episodeNumber` 0 e o proprio numero do trailer na
+    // origem; a URL do episodio se monta com ele. `locked: false`: trailer e
+    // sempre aberto (nunca fica atras do paywall).
+    let outcome = match series.source {
+        Source::Reelshort => {
+            let (segments, _) = crate::reelshort::resolve_media(
+                client, &series.lang, &series.drama_id, 0, &trailer.item_id, false, sess,
+            )
+            .await?;
+            crate::download::download_hls_mp4(client, &segments, &dest, "", control, |_, _| {})
+                .await?
+        }
+        Source::Candyjar => {
+            let (video, audio) = crate::candyjar::resolve_media(
+                client, &series.lang, &series.drama_id, 0, false, cj_cookie,
+            )
+            .await?;
+            crate::download::download_candyjar_mp4(
+                &video, audio.as_deref(), &dest, control, |_, _| {},
+            )
+            .await?
+        }
+        Source::Tiktok => return Ok(None),
+    };
+    match outcome {
         crate::download::Outcome::Done(_) => {
             crate::download::validate_video(&dest, true).await?;
             Ok(Some(TRAILER_FILE.to_string()))
@@ -1150,5 +1172,65 @@ mod tests {
         assert_eq!(ext_for("image/jpeg"), "jpg");
         // Sem tipo declarado, jpg — que e o nome que o contrato usa.
         assert_eq!(ext_for(""), "jpg");
+    }
+
+    /// Ponta a ponta contra o site de verdade: capa da serie, trailer e
+    /// miniatura de episodio, todos do CandyJar — o mesmo padrao que TikTok e
+    /// ReelShort ja tinham. Serie id=10 confirmada com trailer manualmente.
+    /// Marcado `ignore`: rede + FFmpeg.
+    #[tokio::test]
+    #[ignore]
+    async fn candyjar_grava_capa_trailer_e_miniatura_como_as_outras_fontes() {
+        let client = reqwest::Client::new();
+        let series = crate::candyjar::fetch_series(&client, "pt", "10", "")
+            .await
+            .expect("lista a serie");
+        assert!(series.trailer.is_some(), "essa serie tem trailer conhecido");
+        assert!(!series.covers.is_empty(), "essa serie tem capa (og:image)");
+
+        let dir = dir_de_teste("candyjar_e2e");
+
+        let poster = fetch_poster(&client, &series, &dir, "", &[]).await.expect("baixa a capa");
+        assert_eq!(poster, "poster.jpg");
+        assert!(dir.join("poster.jpg").is_file());
+
+        let control = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(crate::download::RUN));
+        let trailer = ensure_trailer(&client, &series, &dir, &crate::reelshort::Session::default(), "", control)
+            .await
+            .expect("baixa o trailer")
+            .expect("essa serie tem trailer");
+        assert_eq!(trailer, TRAILER_FILE);
+        assert!(dir.join(TRAILER_FILE).is_file());
+
+        let ep1 = series.episodes.iter().find(|e| e.number == 1).expect("episodio 1 existe");
+        let thumb = fetch_thumb(&client, series.source, &ep1.thumb, &dir, 1, "", &[])
+            .await
+            .expect("baixa a miniatura do episodio 1");
+        assert_eq!(thumb, format!("{THUMBS_DIR}/E01.jpg"));
+        assert!(dir.join(&thumb).is_file());
+
+        // Monta e grava o manifesto de verdade — o formato que o Noveleiras le.
+        let mut m = read(&dir);
+        patch_series(&mut m, &series, Some(poster));
+        m.trailer = Some(trailer);
+        let entry = episode_entry(ep1, "placeholder - E01.mp4".into(), Some(thumb));
+        patch_episode(&mut m, 1, entry);
+        write(&dir, &m).expect("grava o manifesto");
+
+        let raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        println!("{raw}");
+
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["source"], "candyjar");
+        assert_eq!(v["sourceUrl"], series.url());
+        // O trailer (episodeNumber 0) nao pode contar como episodio: o total
+        // gravado precisa bater exatamente com o que a listagem devolveu.
+        assert_eq!(v["totalEpisodes"], series.episodes.len() as u64);
+        assert_eq!(v["poster"], "poster.jpg");
+        assert_eq!(v["trailer"], "trailer.mp4");
+        assert_eq!(v["episodes"]["1"]["thumb"], format!("{THUMBS_DIR}/E01.jpg"));
+        assert_eq!(v["episodes"]["1"]["locked"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

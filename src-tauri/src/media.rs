@@ -17,10 +17,11 @@ pub enum Source {
     #[default]
     Tiktok,
     Reelshort,
+    Candyjar,
 }
 
 /// Todas as fontes, para varrer estado por fonte sem esquecer nenhuma.
-pub const SOURCES: [Source; 2] = [Source::Tiktok, Source::Reelshort];
+pub const SOURCES: [Source; 3] = [Source::Tiktok, Source::Reelshort, Source::Candyjar];
 
 impl Source {
     /// Prefixo do id da tarefa. Sem ele, um `book_id` do ReelShort e um
@@ -30,6 +31,7 @@ impl Source {
         match self {
             Source::Tiktok => "tk",
             Source::Reelshort => "rs",
+            Source::Candyjar => "cj",
         }
     }
 
@@ -42,6 +44,7 @@ impl Source {
         match self {
             Source::Tiktok => "TikTok",
             Source::Reelshort => "ReelShort",
+            Source::Candyjar => "CandyJar",
         }
     }
 
@@ -50,6 +53,7 @@ impl Source {
         match self {
             Source::Tiktok => "https://www.tiktok.com/login",
             Source::Reelshort => "https://www.reelshort.com/profile",
+            Source::Candyjar => "https://candyjar.com/profile",
         }
     }
 
@@ -58,6 +62,7 @@ impl Source {
         match self {
             Source::Tiktok => "tiktok",
             Source::Reelshort => "reelshort",
+            Source::Candyjar => "candyjar",
         }
     }
 
@@ -68,18 +73,20 @@ impl Source {
         match self {
             Source::Tiktok => "login",
             Source::Reelshort => "login-reelshort",
+            Source::Candyjar => "login-candyjar",
         }
     }
 
     /// Nome do cookie que prova sessao ativa, quando se conhece.
     ///
-    /// No TikTok e o `sessionid`. No ReelShort ainda nao se sabe qual e — por
-    /// isso `None`, e a interface se limita a dizer quantos cookies existem em
-    /// vez de afirmar "conectado" sem ter como provar.
+    /// No TikTok e o `sessionid`. No ReelShort e no CandyJar ainda nao se sabe
+    /// qual e — por isso `None`, e a interface se limita a dizer quantos
+    /// cookies existem em vez de afirmar "conectado" sem ter como provar.
     pub fn session_cookie(&self) -> Option<&'static str> {
         match self {
             Source::Tiktok => Some("sessionid"),
             Source::Reelshort => None,
+            Source::Candyjar => None,
         }
     }
 }
@@ -277,6 +284,10 @@ pub fn series_url(source: Source, drama_id: &str, lang: &str) -> String {
         Source::Reelshort => {
             let lang = if lang.is_empty() { "pt" } else { lang };
             format!("https://www.reelshort.com/{lang}/movie/{drama_id}")
+        }
+        Source::Candyjar => {
+            let lang = if lang.is_empty() { "en" } else { lang };
+            format!("https://candyjar.com/{lang}/series/{drama_id}")
         }
     }
 }

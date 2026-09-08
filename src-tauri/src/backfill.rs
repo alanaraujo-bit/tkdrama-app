@@ -91,6 +91,7 @@ fn source_from_tag(tag: &str) -> Option<Source> {
     match tag.trim().to_ascii_lowercase().as_str() {
         "tiktok" => Some(Source::Tiktok),
         "reelshort" => Some(Source::Reelshort),
+        "candyjar" => Some(Source::Candyjar),
         _ => None,
     }
 }
@@ -146,10 +147,14 @@ pub fn identify(
         source: f.source,
         drama_id: f.drama_id.clone(),
         // A URL guardada na serie acompanhada e a fonte do idioma; ela vence a
-        // reconstrucao, e por isso o chamador prefere `f.url`.
-        lang: crate::reelshort::parse_url(&f.url)
-            .map(|(lang, _)| lang)
-            .unwrap_or_default(),
+        // reconstrucao, e por isso o chamador prefere `f.url`. So ReelShort e
+        // CandyJar usam idioma; cada um tem seu proprio formato de URL.
+        lang: match f.source {
+            Source::Reelshort => crate::reelshort::parse_url(&f.url).map(|(lang, _)| lang),
+            Source::Candyjar => crate::candyjar::parse_url(&f.url).map(|(lang, _)| lang),
+            Source::Tiktok => None,
+        }
+        .unwrap_or_default(),
         stored_url: String::new(),
     })
 }
@@ -476,5 +481,34 @@ mod tests {
         let (lang, book) = crate::reelshort::parse_url(&rs.url()).unwrap();
         assert_eq!(lang, "pt");
         assert_eq!(book, "69d8612ad6461266e80b7a17");
+
+        // CandyJar: sem idioma anotado, "en" — o default do proprio site.
+        let cj = Identity {
+            source: Source::Candyjar,
+            drama_id: "725".into(),
+            lang: String::new(),
+            stored_url: String::new(),
+        };
+        let (lang, id) = crate::candyjar::parse_url(&cj.url()).unwrap();
+        assert_eq!(lang, "en");
+        assert_eq!(id, "725");
+    }
+
+    #[test]
+    fn manifesto_preserva_o_idioma_da_url_do_candyjar() {
+        let dir = dir_de_teste("manifesto_candyjar_pt");
+        let m = manifest::Manifest {
+            drama_id: "725".into(),
+            source: "candyjar".into(),
+            source_url: "https://candyjar.com/pt/series/725".into(),
+            ..Default::default()
+        };
+        manifest::write(&dir, &m).unwrap();
+
+        let id = identify(&dir, &[], &[]).unwrap();
+        let (lang, book) = crate::candyjar::parse_url(&id.url()).unwrap();
+        assert_eq!(lang, "pt");
+        assert_eq!(book, "725");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

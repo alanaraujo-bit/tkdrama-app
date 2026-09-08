@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::candyjar;
 use crate::download::{self, Control, Outcome, CANCEL, PAUSE, RUN};
 use crate::manifest::{self, Manifest};
 use crate::media::{self, Series, Source};
@@ -452,7 +453,7 @@ pub async fn sync_folder(
     // e o caso normal, e uma falha de rede aqui nao pode custar o manifesto.
     let control = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(download::RUN));
     let trailer = manifest::ensure_trailer(
-        &state.client, series, dir, &state.rs_session(), control,
+        &state.client, series, dir, &state.rs_session(), &cookie, control,
     )
     .await
     .unwrap_or(None);
@@ -584,6 +585,7 @@ fn spawn_episode_manifest(state: &Arc<AppState>, id: &str) {
                 m.source = match task.source {
                     Source::Tiktok => "tiktok",
                     Source::Reelshort => "reelshort",
+                    Source::Candyjar => "candyjar",
                 }
                 .into();
             }
@@ -703,6 +705,9 @@ async fn refresh_urls(state: &Arc<AppState>, id: &str) -> anyhow::Result<()> {
     if source == Source::Reelshort {
         return refresh_reelshort(state, id, &drama_id, episode, &item_id, &lang).await;
     }
+    if source == Source::Candyjar {
+        return refresh_candyjar(state, id, &drama_id, episode, &lang).await;
+    }
     let cookie = state.cookie_for(Source::Tiktok);
     let series = tiktok::fetch_series(&state.client, &drama_id, &cookie).await?;
 
@@ -781,6 +786,41 @@ async fn refresh_reelshort(
         if duration > 0 {
             t.duration = duration;
         }
+    }
+    Ok(())
+}
+
+/// Resolve a midia de um episodio do CandyJar na hora de baixar.
+///
+/// Mesma logica de janela do ReelShort: a listagem nao traz URL de video, so a
+/// pagina do episodio. Aqui devolve a URL de video e, quando a origem separa
+/// audio numa faixa a parte (o caso comum), tambem a de audio — ver
+/// `candyjar::select_variant`. `t.urls` guarda uma ou duas entradas: nunca
+/// mais que isso, e a segunda so existe quando ha audio separado.
+async fn refresh_candyjar(
+    state: &Arc<AppState>,
+    id: &str,
+    series_id: &str,
+    episode: u32,
+    lang: &str,
+) -> anyhow::Result<()> {
+    let locked = {
+        let tasks = state.tasks.lock().unwrap();
+        tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.locked)
+            .unwrap_or(true)
+    };
+    let cookie = state.cookie_for(Source::Candyjar);
+    let (video_url, audio_url) =
+        candyjar::resolve_media(&state.client, lang, series_id, episode, locked, &cookie).await?;
+
+    let mut tasks = state.tasks.lock().unwrap();
+    if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
+        t.urls = std::iter::once(video_url).chain(audio_url).collect();
+        t.gear_name = candyjar::GEAR_NAME.to_string();
+        t.codec = "h264".into();
     }
     Ok(())
 }
@@ -889,10 +929,12 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
                 }
         };
 
-        // Duas midias, dois jeitos de baixar. No TikTok `urls` sao CDNs
+        // Tres fontes, tres jeitos de baixar. No TikTok `urls` sao CDNs
         // alternativos do MESMO arquivo (tenta um ate funcionar); no ReelShort
-        // sao os segmentos HLS, todos necessarios e em ordem. Mandar um pelo
-        // caminho do outro geraria arquivo truncado sem erro nenhum.
+        // sao os segmentos HLS, todos necessarios e em ordem; no CandyJar sao
+        // exatamente duas playlists HLS (video e audio) que o FFmpeg junta.
+        // Mandar um pelo caminho do outro geraria arquivo truncado ou sem
+        // audio, sem erro nenhum.
         let result = match source {
             Source::Reelshort => {
                 let rs_cookie = state.cookie_for(Source::Reelshort);
@@ -912,6 +954,16 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
                     &gear,
                     &dest,
                     &cookie,
+                    control,
+                    on_progress,
+                )
+                .await
+            }
+            Source::Candyjar => {
+                download::download_candyjar_mp4(
+                    &gear.urls[0],
+                    gear.urls.get(1).map(|s| s.as_str()),
+                    &dest,
                     control,
                     on_progress,
                 )
@@ -1027,7 +1079,11 @@ fn friendly(msg: &str) -> String {
         "precisa ser desbloqueado no TikTok"
     } else if m.contains("ffmpeg nao foi encontrado") {
         "instalacao incompleta — reinstale o tkdrama"
-    } else if m.contains("converter o episodio para mp4") || m.contains("mp4 vazio") {
+    } else if m.contains("converter o episodio para mp4")
+        || m.contains("mp4 vazio")
+        || m.contains("não consegui preparar o mp4")
+        || m.contains("não consegui baixar o episódio do candyjar")
+    {
         "nao consegui preparar o MP4"
     } else {
         "falha de rede"
