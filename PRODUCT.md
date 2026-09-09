@@ -29,7 +29,10 @@ Ele abre o app e os episódios que saíram desde ontem já estão baixados.
 ## O trabalho principal
 
 1. Entrar no TikTok uma vez (janela de login dentro do app).
-2. Colar o link da novela.
+2. Colar o link da novela — um, ou **muitos de uma vez**. Apontar novela a
+   novela é o gargalo real quando a lista tem dezenas: colar trinta links de
+   uma vez e sair é o caminho que mantém a promessa de "durmo e acordo com
+   tudo baixado".
 3. **Baixar tudo** — o caminho dominante. Escolher episódios soltos existe, mas é
    a exceção.
 4. **Acompanhar** a novela — aponta-se uma vez e o app revisita sozinho, de
@@ -71,8 +74,10 @@ Ele abre o app e os episódios que saíram desde ontem já estão baixados.
   do alcance da conta entra na lista como bloqueado, nunca como download.
 - Sem player embutido: o objetivo é ter o arquivo, assistido onde o usuário quiser.
 - Sem catálogo/busca de novelas dentro do app: a descoberta de novela **nova**
-  acontece no TikTok, e o app recebe o link. O automático reabastece o que já
-  foi apontado uma vez — ele nunca escolhe novela por conta própria.
+  acontece na plataforma, e o app recebe o link. O automático reabastece o que
+  já foi apontado uma vez — ele nunca escolhe novela por conta própria. Colar
+  trinta links de uma vez não fere esse limite: continua sendo o usuário
+  apontando, só que em lote em vez de um a um.
 - A pasta só contém novela que o usuário apontou. É por isso que o automático
   serve a lista de acompanhadas, e não um ranking: um agendador sobre "as mais
   em alta" encheria o disco de série que ninguém escolheu assistir.

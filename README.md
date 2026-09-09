@@ -1,10 +1,10 @@
 # tkdrama
 
 App de desktop para Windows que baixa novelas verticais (*short dramas*) do
-TikTok e do ReelShort e guarda em disco, para assistir offline, em qualquer
-player, a qualquer momento.
+TikTok, do ReelShort, do CandyJar e do DramaBox e guarda em disco, para assistir
+offline, em qualquer player, a qualquer momento.
 
-Nenhuma das duas plataformas oferece download dessas séries nem expõe a lista de
+Nenhuma dessas plataformas oferece download dessas séries nem expõe a lista de
 episódios como playlist. O app descobre os episódios sozinho pela API interna,
 usando a sessão do próprio usuário, e baixa tudo em fila — o que hoje só existe
 como trabalho manual, episódio por episódio.
@@ -14,6 +14,13 @@ como trabalho manual, episódio por episódio.
 - **Descobre a série inteira a partir de um link.** Cola-se a URL da novela (ou
   a de um episódio) e o app pagina a API até o último episódio, com a numeração
   correta.
+- **Adiciona muitas novelas de uma colagem só.** *Adicionar em lote* aceita
+  texto solto — uma coluna de links, um bloco de conversa, HTML copiado de uma
+  página — acha os links no meio, deduplica por novela e processa a lista
+  inteira, já enfileirando e já marcando cada uma como acompanhada. É o que
+  troca trinta idas à plataforma por uma. A rodada respeita o mesmo ritmo do
+  acompanhamento automático (20s entre uma novela e outra), então ela anuncia
+  onde está e pode ser cancelada.
 - **Baixa em fila**, com prioridade, pausa/retomada e até 3 downloads
   simultâneos — ou um de cada vez, em ordem, no modo sequencial.
 - **Acompanha novelas sozinho.** Aponta-se a série uma vez e o app a revisita de
@@ -21,6 +28,25 @@ como trabalho manual, episódio por episódio.
   dispensa voltar à plataforma toda semana para colar o mesmo link.
 - **Retomada real:** downloads sobrevivem a fechar o app, queda de rede e
   desligamento. Nada recomeça do zero.
+- **Aguenta a noite sozinho.** Uma fila grande é deixada rodando sem ninguém
+  olhando, e é isso que o desenho protege:
+  - **Nunca baixa o mesmo episódio duas vezes.** Quem enfileira consulta a pasta
+    por *número* de episódio — não pelo nome que o downloader escreveria hoje —
+    então um arquivo renomeado, ou vindo de quando a novela tinha outro título,
+    continua contando como "já tenho". Colar o link de uma novela que já está no
+    disco avisa quantos você tem e enfileira só os que faltam.
+  - **Queda de rede não vira muro de erros.** Quando as falhas são de rede o
+    agendador fecha o portão e para de puxar tarefa nova, em vez de queimar as
+    seis tentativas de cada uma em quatro minutos. Uma sonda testa a conexão a
+    cada 15s e reabre o portão sozinha quando ela volta.
+  - **Zelador de dez em dez minutos**, que devolve à fila o que falhou por
+    motivo passageiro (rede, link assinado vencido, disco cheio) — até doze
+    vezes por episódio, cerca de duas horas de recuperação. O que é definitivo
+    (pago, fora do ar, sessão expirada) não gira em falso.
+  - **A máquina não suspende enquanto há fila.** É o defeito que nenhuma
+    retentativa alcança: fila imortal em computador suspenso não baixa nada. O
+    pedido é só "não suspenda" — a tela apaga normalmente — e é devolvido assim
+    que a fila esvazia.
 - **Deixa a ficha da novela na pasta.** Junto dos vídeos vão um `manifest.json`,
   a capa (`poster.jpg`) e a miniatura de cada episódio (`thumbs/E##.jpg`) — o que
   permite a um app de biblioteca exibir o catálogo sem falar com a plataforma.
@@ -51,8 +77,9 @@ nunca por URL já resolvida.
 - Uma conta na plataforma de onde se vai baixar
 
 Não precisa instalar FFmpeg: o executável necessário já acompanha o app. Os
-episódios do TikTok vêm como MP4; os do ReelShort são baixados como MPEG-TS e
-remuxados sem perda para MP4. Se os codecs não forem H.264/AAC, o FFmpeg os
+episódios do TikTok e do DramaBox vêm como MP4; os do ReelShort são baixados
+como MPEG-TS e remuxados sem perda para MP4, e os do CandyJar chegam em HLS e
+são empacotados pelo FFmpeg. Se os codecs não forem H.264/AAC, o FFmpeg os
 converte. O arquivo só aparece como concluído após validação integral e
 `faststart`; até lá usa os sufixos `.part`/`.parcial.mp4`.
 
@@ -81,8 +108,14 @@ npm run tauri build
 2. Cole o link da novela e clique em **Buscar**.
 3. **Baixar tudo** — ou **Escolher episódios**, se quiser só alguns.
 4. Opcionalmente, **Acompanhar**: a partir daí os episódios novos entram na fila
-   sozinhos. Em *Ajustes* ficam o intervalo e os limites (novelas e GB por
-   rodada, piso de espaço livre em disco).
+   sozinhos. Em *Ajustes → Automático* ficam o intervalo e os limites (novelas e
+   GB por rodada, piso de espaço livre em disco), junto da conta de quanto cada
+   rodada leva com esses limites.
+
+Para muitas novelas de uma vez, pule os passos 2 a 4: **Adicionar em lote**,
+cole tudo o que você juntou, confira a prévia (ela roda sem rede) e mande
+adicionar. Com *Acompanhar* marcado — o padrão — a lista passa a se manter
+sozinha.
 
 Cada novela vira uma subpasta com o nome dela, e os arquivos saem numerados
 (`Nome da novela - E01.mp4`).
@@ -138,8 +171,12 @@ src-tauri/src/
   queue.rs      motor da fila: prioridade, concorrência, persistência
   download.rs   download com retomada
   watch.rs      novelas acompanhadas e reabastecimento automático
+  bulk.rs       muitas novelas de uma colagem só: extrai, deduplica, processa
+  awake.rs      impede a máquina de suspender enquanto a fila tem trabalho
   tiktok.rs     cliente da API de short dramas do TikTok
   reelshort.rs  cliente do ReelShort (HLS)
+  candyjar.rs   cliente do CandyJar (HLS, fMP4/CMAF)
+  dramabox.rs   cliente do DramaBox (MP4 progressivo assinado)
   media.rs      tipos comuns e escolha de qualidade
   manifest.rs   ficha da novela em disco: manifest.json, capa, miniaturas
   backfill.rs   varredura que dá ficha ao que já foi baixado

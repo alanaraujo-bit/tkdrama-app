@@ -9,24 +9,62 @@
     <title>tkdrama</title>
   </head>
   <body>
+    <!--
+      Estrutura em três camadas, e cada coisa numa só delas:
+
+      1. Barra de topo — identidade, navegação, e o que é sempre verdade (contas).
+      2. Barra de adicionar — a única ação de entrada, sempre alcançável.
+      3. Uma visão por vez — Fila ou Acompanhando. Nunca as duas empilhadas se
+         empurrando, que era o defeito da tela de uma coluna só.
+
+      O que é transitório mora em modal: a novela recém-buscada, o lote, as
+      contas, os ajustes. O que é estado permanente fica na tela.
+    -->
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
         <span class="brand-name">tkdrama</span>
       </div>
 
+      <!--
+        Os contadores ficam na aba, não dentro dela: a primeira pergunta ao
+        abrir o app é "como está a fila?", e ela precisa ter resposta mesmo
+        com a outra visão aberta.
+      -->
+      <nav class="tabs" role="tablist" aria-label="Seções">
+        <button
+          id="tab-queue"
+          class="tab is-active"
+          type="button"
+          role="tab"
+          aria-selected="true"
+          aria-controls="view-queue"
+        >
+          Fila
+          <span id="tab-queue-count" class="tab-count"></span>
+        </button>
+        <button
+          id="tab-watch"
+          class="tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="view-watch"
+        >
+          Acompanhando
+          <span id="tab-watch-count" class="tab-count"></span>
+        </button>
+      </nav>
+
       <div class="topbar-right">
-        <button id="auth-chip" class="chip" type="button">
+        <!--
+          Um indicador, não quatro. Os quatro chips ocupavam meia barra para
+          dizer algo que quase nunca muda; o detalhe por plataforma mora no
+          modal, a um clique.
+        -->
+        <button id="accounts-chip" class="chip" type="button" title="Contas das plataformas">
           <span class="chip-dot" aria-hidden="true"></span>
-          <span id="auth-label">verificando...</span>
-        </button>
-        <button id="auth-chip-rs" class="chip" type="button">
-          <span class="chip-dot" aria-hidden="true"></span>
-          <span id="auth-label-rs">verificando...</span>
-        </button>
-        <button id="auth-chip-cj" class="chip" type="button">
-          <span class="chip-dot" aria-hidden="true"></span>
-          <span id="auth-label-cj">verificando...</span>
+          <span id="accounts-label">contas</span>
         </button>
         <button id="open-settings" class="icon-btn" type="button" title="Ajustes" aria-label="Ajustes">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Z"/><path d="M19.4 13a7.9 7.9 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7.9 7.9 0 0 0-1.7-1L14.9 3h-3.8l-.4 2.6a7.9 7.9 0 0 0-1.7 1l-2.4-1-2 3.4L4.6 11a7.9 7.9 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7.9 7.9 0 0 0 1.7 1l.4 2.6h3.8l.4-2.6a7.9 7.9 0 0 0 1.7-1l2.4 1 2-3.4Z"/></svg>
@@ -34,7 +72,7 @@
       </div>
     </header>
 
-    <!-- Barra de busca: colar o link da novela -->
+    <!-- A entrada: um link ou muitos. Nada mais compete com ela. -->
     <section class="addbar">
       <div class="field">
         <svg class="field-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
@@ -43,79 +81,33 @@
           type="text"
           spellcheck="false"
           autocomplete="off"
-          placeholder="Cole o link da novela (TikTok, ReelShort ou CandyJar)"
+          placeholder="Cole o link da novela (TikTok, ReelShort, CandyJar ou DramaBox)"
           aria-label="Link da novela"
         />
       </div>
       <button id="fetch-btn" class="btn btn-primary" type="button">Buscar</button>
+      <button
+        id="open-bulk"
+        class="btn"
+        type="button"
+        title="Cole de uma vez todos os links que você juntou — o app resolve a lista inteira sozinho"
+      >
+        Adicionar em lote
+      </button>
     </section>
 
     <div id="banner" class="banner" hidden></div>
 
     <main class="content">
-      <!-- Painel da serie encontrada -->
-      <section id="series-panel" class="panel" hidden>
-        <div class="series-head">
-          <img id="series-cover" class="series-cover" alt="" />
-          <div class="series-meta">
-            <h2 id="series-name"></h2>
-            <p id="series-stats" class="muted"></p>
-            <p id="series-desc" class="series-desc"></p>
-          </div>
-          <button id="series-close" class="icon-btn" type="button" title="Fechar" aria-label="Fechar">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
-          </button>
-        </div>
-
-        <div class="series-actions">
-          <button id="download-all" class="btn btn-primary btn-lg" type="button">
-            Baixar tudo
-          </button>
-          <button id="download-sequential" class="btn btn-lg" type="button" title="Baixa um episódio de cada vez, do primeiro ao último">
-            Baixar em sequência
-          </button>
-          <button id="follow-series" class="btn btn-lg" type="button" title="Passa a verificar esta novela sozinho e baixa os episódios novos assim que saírem">
-            Acompanhar
-          </button>
-          <button id="toggle-picker" class="btn" type="button" aria-expanded="false">
-            Escolher episódios
-          </button>
-          <span id="pick-summary" class="muted pick-summary"></span>
-        </div>
-
-        <div id="picker" class="picker" hidden>
-          <div class="picker-tools">
-            <button class="link-btn" data-pick="all" type="button">Todos</button>
-            <button class="link-btn" data-pick="none" type="button">Nenhum</button>
-            <button class="link-btn" data-pick="missing" type="button">Só os que faltam</button>
-            <span class="picker-hint">clique e arraste, ou shift+clique para intervalo</span>
-          </div>
-          <div id="ep-grid" class="ep-grid"></div>
-          <div class="picker-footer">
-            <button id="download-selected" class="btn btn-primary" type="button" disabled>
-              Baixar selecionados
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <!-- Novelas acompanhadas: o app revisita sozinho e baixa o que sair -->
-      <section id="watch-panel" class="panel" hidden>
-        <div class="queue-head">
-          <h2>Acompanhando</h2>
-          <div class="queue-tools">
-            <span id="watch-next" class="muted"></span>
-            <button id="watch-now" class="btn btn-sm" type="button">Verificar agora</button>
-          </div>
-        </div>
-        <div id="watch-list" class="watch-list" role="list"></div>
-      </section>
-
-      <!-- Fila -->
-      <section class="panel queue-panel">
-        <div class="queue-head">
+      <!--
+        As duas visões existem sempre no DOM e trocam por `hidden`. Desmontar a
+        lista da fila apagaria as linhas que o render reconcilia por chave — e
+        a fila voltaria a congelar, que foi o defeito que custou mais caro aqui.
+      -->
+      <section id="view-queue" class="view" role="tabpanel" aria-labelledby="tab-queue">
+        <div class="view-head">
           <h2>Fila</h2>
-          <div class="queue-tools">
+          <div class="view-tools">
             <button id="pause-all" class="btn btn-sm" type="button">Pausar tudo</button>
             <button id="resume-all" class="btn btn-sm" type="button">Retomar</button>
             <button id="retry-failed" class="btn btn-sm" type="button">Tentar de novo</button>
@@ -126,16 +118,64 @@
         <div id="queue-empty" class="empty">
           <p class="empty-title">A fila está vazia</p>
           <p class="empty-hint">
-            Cole o link de uma novela do TikTok ou do ReelShort lá em cima e clique em Buscar.
+            Cole o link de uma novela lá em cima e clique em <strong>Buscar</strong>.
             O app encontra todos os episódios sozinho.
           </p>
           <p class="empty-hint">
-            Depois de buscar, use <strong>Acompanhar</strong>: o app revisita a novela de
-            tempos em tempos e baixa o episódio novo sem você colar o link de novo.
+            Juntou vários links? <strong>Adicionar em lote</strong> resolve a lista
+            inteira de uma vez — e já deixa cada novela em Acompanhando, para que os
+            episódios novos entrem na fila sem você colar link de novo.
           </p>
         </div>
 
         <div id="queue-list" class="queue-list" role="list"></div>
+      </section>
+
+      <section id="view-watch" class="view" role="tabpanel" aria-labelledby="tab-watch" hidden>
+        <div class="view-head">
+          <h2>Acompanhando</h2>
+          <div class="view-tools">
+            <span id="watch-next" class="muted"></span>
+            <button id="watch-now" class="btn btn-sm" type="button">Verificar agora</button>
+          </div>
+        </div>
+
+        <!--
+          Busca e filtro não são enfeite: com dezenas de novelas acompanhadas, a
+          lista corrida deixa de responder "esta aqui já foi verificada?" — que é
+          a única pergunta que se faz nesta tela.
+        -->
+        <div class="watch-bar">
+          <div class="field field-sm">
+            <svg class="field-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14ZM21 21l-5-5"/></svg>
+            <input
+              id="watch-search"
+              type="search"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="Filtrar por nome"
+              aria-label="Filtrar novelas acompanhadas"
+            />
+          </div>
+          <div class="segmented" role="group" aria-label="Filtrar por estado">
+            <button class="seg is-active" data-watch-filter="all" type="button">Todas</button>
+            <button class="seg" data-watch-filter="active" type="button">Ativas</button>
+            <button class="seg" data-watch-filter="paused" type="button">Pausadas</button>
+            <button class="seg" data-watch-filter="error" type="button">Com erro</button>
+          </div>
+          <span class="spacer"></span>
+          <span id="watch-count" class="muted num"></span>
+        </div>
+
+        <div id="watch-empty" class="empty" hidden>
+          <p class="empty-title">Nada sendo acompanhado ainda</p>
+          <p class="empty-hint">
+            Busque uma novela e clique em <strong>Acompanhar</strong>. A partir daí o
+            app revisita ela sozinho e baixa o episódio novo assim que ele existe.
+          </p>
+        </div>
+
+        <div id="watch-list" class="watch-list" role="list"></div>
       </section>
     </main>
 
@@ -151,7 +191,186 @@
       <button id="open-folder" class="link-btn" type="button">Abrir pasta</button>
     </footer>
 
-    <!-- Ajustes -->
+    <!--
+      A novela recém-buscada é um momento de decisão, não um estado do app: ela
+      vive enquanto se escolhe o que fazer, e some depois. Por isso modal — e
+      por isso ela não empurra mais a fila para baixo da dobra.
+    -->
+    <div id="series-modal" class="modal" hidden>
+      <div class="modal-card modal-wide" role="dialog" aria-modal="true" aria-labelledby="series-name">
+        <div id="series-panel" class="series-panel">
+          <div class="series-head">
+            <!-- Nasce escondida: sem `src`, o primeiro quadro seria o ícone de
+                 imagem quebrada. O render a mostra quando a capa existe. -->
+            <img id="series-cover" class="series-cover" alt="" hidden />
+            <div class="series-meta">
+              <h2 id="series-name"></h2>
+              <p id="series-stats" class="muted"></p>
+              <p id="series-desc" class="series-desc"></p>
+            </div>
+            <button id="series-close" class="icon-btn" type="button" title="Fechar" aria-label="Fechar">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </div>
+
+          <div class="series-body">
+            <div class="series-actions">
+              <button id="download-all" class="btn btn-primary btn-lg" type="button">
+                Baixar tudo
+              </button>
+              <button id="download-sequential" class="btn btn-lg" type="button" title="Baixa um episódio de cada vez, do primeiro ao último">
+                Baixar em sequência
+              </button>
+              <button id="follow-series" class="btn btn-lg" type="button" title="Passa a verificar esta novela sozinho e baixa os episódios novos assim que saírem">
+                Acompanhar
+              </button>
+              <button id="toggle-picker" class="btn" type="button" aria-expanded="false">
+                Escolher episódios
+              </button>
+              <span id="pick-summary" class="muted pick-summary"></span>
+            </div>
+
+            <div id="picker" class="picker" hidden>
+              <div class="picker-tools">
+                <button class="link-btn" data-pick="all" type="button">Todos</button>
+                <button class="link-btn" data-pick="none" type="button">Nenhum</button>
+                <button class="link-btn" data-pick="missing" type="button">Só os que faltam</button>
+                <span class="picker-hint">clique e arraste, ou shift+clique para intervalo</span>
+              </div>
+              <div id="ep-grid" class="ep-grid"></div>
+              <div class="picker-footer">
+                <button id="download-selected" class="btn btn-primary" type="button" disabled>
+                  Baixar selecionados
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!--
+      Lote: a colagem única que substitui trinta idas à plataforma.
+
+      A caixa aceita texto solto de propósito — o link raramente chega limpo,
+      uma linha por vez. Exigir formato devolveria à mão o trabalho que este
+      modal existe para tirar. A prévia roda sem rede: o usuário vê o que vai
+      acontecer ANTES de mandar rodar, porque a rodada leva minutos.
+    -->
+    <div id="bulk-modal" class="modal" hidden>
+      <div class="modal-card modal-wide" role="dialog" aria-modal="true" aria-labelledby="bulk-title">
+        <div class="modal-head">
+          <h2 id="bulk-title">Adicionar em lote</h2>
+          <button id="close-bulk" class="icon-btn" type="button" aria-label="Fechar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+
+        <div class="modal-body">
+          <label class="setting">
+            <span class="setting-label">Cole os links</span>
+            <textarea
+              id="bulk-input"
+              class="bulk-input"
+              rows="7"
+              spellcheck="false"
+              placeholder="Cole aqui quantos links quiser — um por linha, ou tudo misturado no meio de um texto. O app acha os links sozinho."
+            ></textarea>
+            <span class="setting-hint">
+              TikTok, ReelShort, CandyJar e DramaBox. Link repetido e link da mesma
+              novela contam uma vez só.
+            </span>
+          </label>
+
+          <div id="bulk-summary" class="bulk-summary" hidden></div>
+          <ul id="bulk-list" class="bulk-list" hidden></ul>
+
+          <fieldset class="setting">
+            <legend class="setting-label">O que fazer com cada uma</legend>
+            <label class="check-setting">
+              <input id="bulk-download" type="checkbox" checked />
+              <span>
+                <strong>Baixar todos os episódios disponíveis agora</strong>
+                <span class="setting-hint">O que a sua conta não libera entra como bloqueado, nunca como download.</span>
+              </span>
+            </label>
+            <label class="check-setting">
+              <input id="bulk-follow" type="checkbox" checked />
+              <span>
+                <strong>Acompanhar daqui em diante</strong>
+                <span class="setting-hint">
+                  Episódio novo entra na fila sozinho, sem você colar o link de novo.
+                  É isto que faz a lista se manter sem trabalho seu.
+                </span>
+              </span>
+            </label>
+          </fieldset>
+
+          <!--
+            A rodada é lenta por decisão, não por lentidão: 20s entre uma novela
+            e outra. Sem dizer isso e sem dizer onde está, o botão viraria um
+            retângulo congelado por um quarto de hora.
+          -->
+          <div id="bulk-progress" class="bulk-progress" hidden>
+            <div class="bar"><span id="bulk-bar" class="bar-fill"></span></div>
+            <p id="bulk-progress-text" class="muted"></p>
+          </div>
+
+          <div id="bulk-report" class="bulk-report" hidden></div>
+        </div>
+
+        <div class="modal-foot bulk-foot">
+          <span id="bulk-eta" class="muted"></span>
+          <span class="spacer"></span>
+          <button id="bulk-cancel" class="btn" type="button" hidden>Cancelar</button>
+          <button id="bulk-run" class="btn btn-primary" type="button" disabled>Adicionar</button>
+        </div>
+      </div>
+    </div>
+
+    <!--
+      Contas: o detalhe das quatro plataformas, que antes ocupava a barra de topo
+      inteira para dizer algo que muda uma vez por mês.
+    -->
+    <div id="accounts-modal" class="modal" hidden>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="accounts-title">
+        <div class="modal-head">
+          <h2 id="accounts-title">Contas</h2>
+          <button id="close-accounts" class="icon-btn" type="button" aria-label="Fechar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <p class="setting-hint">
+            O app baixa apenas o que a sua conta já pode assistir. Entrar é uma vez só:
+            a sessão fica nesta máquina e sobrevive ao fechamento.
+          </p>
+          <div class="accounts">
+            <button id="auth-chip" class="chip chip-row" type="button">
+              <span class="chip-dot" aria-hidden="true"></span>
+              <span id="auth-label">verificando...</span>
+            </button>
+            <button id="auth-chip-rs" class="chip chip-row" type="button">
+              <span class="chip-dot" aria-hidden="true"></span>
+              <span id="auth-label-rs">verificando...</span>
+            </button>
+            <button id="auth-chip-cj" class="chip chip-row" type="button">
+              <span class="chip-dot" aria-hidden="true"></span>
+              <span id="auth-label-cj">verificando...</span>
+            </button>
+            <button id="auth-chip-db" class="chip chip-row" type="button">
+              <span class="chip-dot" aria-hidden="true"></span>
+              <span id="auth-label-db">verificando...</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!--
+      Ajustes em abas: eram quatro assuntos diferentes numa rolagem só, e o que
+      se procurava ficava sempre no meio. Cada aba responde uma pergunta.
+    -->
     <div id="settings-modal" class="modal" hidden>
       <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <div class="modal-head">
@@ -161,59 +380,71 @@
           </button>
         </div>
 
-        <div class="modal-body">
-          <label class="setting">
-            <span class="setting-label">Pasta de destino</span>
-            <div class="setting-row">
-              <input id="set-dest" type="text" spellcheck="false" />
-              <button id="browse-dest" class="btn" type="button">Procurar</button>
-            </div>
-            <span class="setting-hint">Cada novela vira uma subpasta com o nome dela.</span>
-          </label>
+        <nav class="subtabs" role="tablist" aria-label="Seções dos ajustes">
+          <button class="subtab is-active" data-settings-tab="geral" type="button" role="tab" aria-selected="true">Geral</button>
+          <button class="subtab" data-settings-tab="downloads" type="button" role="tab" aria-selected="false">Downloads</button>
+          <button class="subtab" data-settings-tab="auto" type="button" role="tab" aria-selected="false">Automático</button>
+          <button class="subtab" data-settings-tab="biblioteca" type="button" role="tab" aria-selected="false">Biblioteca</button>
+        </nav>
 
-          <!--
-            A ficha (manifest.json + capa + miniaturas) é escrita sozinha a cada
-            download. Este botão existe para o que já está no disco: sem ele, a
-            biblioteca de hoje ficaria sem arte para sempre.
-          -->
-          <div class="setting">
-            <span class="setting-label">Ficha das novelas</span>
-            <div class="setting-row">
-              <button id="meta-refresh" class="btn" type="button">Atualizar metadados</button>
-              <span id="meta-status" class="muted"></span>
-            </div>
-            <span class="setting-hint">
-              Percorre as pastas já baixadas e grava em cada uma a ficha da novela:
-              <code>manifest.json</code>, a capa e a miniatura de cada episódio.
-              Não baixa vídeo nenhum — só consulta os dados da série, com 20s entre
-              uma e outra para não derrubar a sessão.
-            </span>
-            <!--
-              O nome da pasta não carrega o ID da novela, e não existe busca por
-              nome na API. Uma pasta só se identifica se tiver ficha, ou se
-              estiver na fila ou na lista de acompanhadas. As que sobram
-              aparecem aqui: basta buscar cada uma pelo link, uma vez.
-            -->
-            <div id="meta-unresolved" class="meta-unresolved" hidden>
-              <p class="setting-hint">
-                Estas pastas o app não consegue identificar — o nome não diz qual novela é.
-                Cole o link de cada uma lá em cima e clique em <strong>Buscar</strong>:
-                isso já grava a ficha na pasta, e depois disso ela se identifica sozinha.
-              </p>
-              <ul id="meta-unresolved-list"></ul>
-            </div>
+        <div class="modal-body">
+          <!-- Geral -->
+          <div class="settings-pane" data-settings-pane="geral">
+            <label class="setting">
+              <span class="setting-label">Pasta de destino</span>
+              <div class="setting-row">
+                <input id="set-dest" type="text" spellcheck="false" />
+                <button id="browse-dest" class="btn" type="button">Procurar</button>
+              </div>
+              <span class="setting-hint">Cada novela vira uma subpasta com o nome dela.</span>
+            </label>
           </div>
 
-          <label class="check-setting">
-            <input id="set-sequential" type="checkbox" />
-            <span>
-              <strong>Baixar em sequência</strong>
-              <span class="setting-hint">Um episódio por vez, do primeiro ao último. Mais estável para filas grandes.</span>
-            </span>
-          </label>
+          <!-- Downloads -->
+          <div class="settings-pane" data-settings-pane="downloads" hidden>
+            <label class="check-setting">
+              <input id="set-sequential" type="checkbox" />
+              <span>
+                <strong>Baixar em sequência</strong>
+                <span class="setting-hint">Um episódio por vez, do primeiro ao último. Mais estável para filas grandes.</span>
+              </span>
+            </label>
 
-          <fieldset class="setting">
-            <legend class="setting-label">Baixar sozinho</legend>
+            <label class="setting">
+              <span class="setting-label">Downloads simultâneos</span>
+              <div class="setting-row">
+                <input id="set-conc" type="range" min="1" max="3" step="1" />
+                <output id="set-conc-out" class="num"></output>
+              </div>
+              <span class="setting-hint">Até 3 mantém a fila estável. Para máxima segurança, use o modo em sequência acima.</span>
+            </label>
+
+            <fieldset class="setting">
+              <legend class="setting-label">Qualidade</legend>
+              <label class="radio">
+                <input type="radio" name="codec" value="h264" />
+                <span>
+                  <strong>H.264 — maior qualidade real</strong>
+                  <span class="setting-hint">
+                    Toca em qualquer player. É o maior bitrate disponível.
+                  </span>
+                </span>
+              </label>
+              <label class="radio">
+                <input type="radio" name="codec" value="h265" />
+                <span>
+                  <strong>H.265 — quadro maior</strong>
+                  <span class="setting-hint">
+                    Resolução maior, mas bitrate menor: o 1080p aqui é upscale, com
+                    menos detalhe que o 540p. Alguns players antigos não abrem.
+                  </span>
+                </span>
+              </label>
+            </fieldset>
+          </div>
+
+          <!-- Automático -->
+          <div class="settings-pane" data-settings-pane="auto" hidden>
             <label class="check-setting">
               <input id="set-auto" type="checkbox" />
               <span>
@@ -260,39 +491,51 @@
               </div>
               <span class="setting-hint">Com menos espaço que isso, a rodada nem começa.</span>
             </label>
-          </fieldset>
 
-          <label class="setting">
-            <span class="setting-label">Downloads simultâneos</span>
-            <div class="setting-row">
-              <input id="set-conc" type="range" min="1" max="3" step="1" />
-              <output id="set-conc-out" class="num"></output>
+            <!--
+              A conta que o usuário não consegue fazer de cabeça, e que decide se
+              a promessa "durmo e acordo com tudo baixado" é verdadeira: com 20s
+              entre novelas, o teto de séries vira minutos de verificação. Sem
+              mostrar isso, ele ajustaria os limites no escuro.
+            -->
+            <p id="auto-math" class="setting-note"></p>
+          </div>
+
+          <!-- Biblioteca -->
+          <div class="settings-pane" data-settings-pane="biblioteca" hidden>
+            <!--
+              A ficha (manifest.json + capa + miniaturas) é escrita sozinha a cada
+              download. Este botão existe para o que já está no disco: sem ele, a
+              biblioteca de hoje ficaria sem arte para sempre.
+            -->
+            <div class="setting">
+              <span class="setting-label">Ficha das novelas</span>
+              <div class="setting-row">
+                <button id="meta-refresh" class="btn" type="button">Atualizar metadados</button>
+                <span id="meta-status" class="muted"></span>
+              </div>
+              <span class="setting-hint">
+                Percorre as pastas já baixadas e grava em cada uma a ficha da novela:
+                <code>manifest.json</code>, a capa e a miniatura de cada episódio.
+                Não baixa vídeo nenhum — só consulta os dados da série, com 20s entre
+                uma e outra para não derrubar a sessão.
+              </span>
+              <!--
+                O nome da pasta não carrega o ID da novela, e não existe busca por
+                nome na API. Uma pasta só se identifica se tiver ficha, ou se
+                estiver na fila ou na lista de acompanhadas. As que sobram
+                aparecem aqui: basta buscar cada uma pelo link, uma vez.
+              -->
+              <div id="meta-unresolved" class="meta-unresolved" hidden>
+                <p class="setting-hint">
+                  Estas pastas o app não consegue identificar — o nome não diz qual novela é.
+                  Cole o link de cada uma lá em cima e clique em <strong>Buscar</strong>:
+                  isso já grava a ficha na pasta, e depois disso ela se identifica sozinha.
+                </p>
+                <ul id="meta-unresolved-list"></ul>
+              </div>
             </div>
-            <span class="setting-hint">Até 3 mantém a fila estável. Para máxima segurança, use o modo em sequência abaixo.</span>
-          </label>
-
-          <fieldset class="setting">
-            <legend class="setting-label">Qualidade</legend>
-            <label class="radio">
-              <input type="radio" name="codec" value="h264" />
-              <span>
-                <strong>H.264 — maior qualidade real</strong>
-                <span class="setting-hint">
-                  Toca em qualquer player. É o maior bitrate disponível.
-                </span>
-              </span>
-            </label>
-            <label class="radio">
-              <input type="radio" name="codec" value="h265" />
-              <span>
-                <strong>H.265 — quadro maior</strong>
-                <span class="setting-hint">
-                  Resolução maior, mas bitrate menor: o 1080p aqui é upscale, com
-                  menos detalhe que o 540p. Alguns players antigos não abrem.
-                </span>
-              </span>
-            </label>
-          </fieldset>
+          </div>
         </div>
 
         <div class="modal-foot">

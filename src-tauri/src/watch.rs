@@ -302,6 +302,8 @@ mod tests {
             speed: 0.0,
             attempts: 0,
             retry_at: 0,
+            fail_kind: crate::queue::FailKind::None,
+            revivals: 0,
             elapsed_secs: 0,
             created_at: 0,
             finished_at: None,

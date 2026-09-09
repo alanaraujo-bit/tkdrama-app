@@ -50,8 +50,12 @@ D:\Novelas\A cura mortal do bilionário\
 
 ### `poster.jpg`
 
-De `dramaInfo.cover.urlList[0]` (TikTok), `book_pic` (ReelShort) ou a meta tag
-`og:image` da página da série (CandyJar).
+De `dramaInfo.cover.urlList[0]` (TikTok), `book_pic` (ReelShort), a meta tag
+`og:image` da página da série (CandyJar) ou `bookInfo.cover` (DramaBox).
+
+No DramaBox as URLs de imagem trazem um sufixo de recorte
+(`...capa.jpg@w=360&h=640`); ele é removido antes de baixar, porque o mesmo
+caminho sem o sufixo entrega o original — que é o que esta seção pede.
 
 Use `cover.urlList`, **não** `zoomCover`: o `zoomCover` é um recorte quadrado
 de 240–960 px, e a capa do app é vertical (720×1080). O `urlList` traz a
@@ -64,8 +68,8 @@ de episódios, e é genuinamente distinto por episódio.
 
 No ReelShort a lista de capítulos não traz miniatura — nesse caso, sem
 `thumbs/`, e o app cai na arte gerada. Melhor faltar do que inventar. O
-CandyJar traz `posterUrl`/`verticalPosterUrl` por episódio, então ali
-`thumbs/` é gravado normalmente.
+CandyJar traz `posterUrl`/`verticalPosterUrl` por episódio e o DramaBox traz
+`cover`, então nos dois `thumbs/` é gravado normalmente.
 
 ### `trailer.mp4`
 
@@ -75,8 +79,8 @@ download e validação (MP4 real, H.264/AAC, faststart). Não é episódio: não
 tem número, não entra em `totalEpisodes` nem em `episodes`.
 
 Hoje o ReelShort e o CandyJar publicam trailer (é o item de número/`serial
-number` 0 na listagem, marcado como tal); o TikTok não. Novela sem trailer é
-o caso comum — o campo fica ausente, nunca `null` nem inventado.
+number` 0 na listagem, marcado como tal); o TikTok e o DramaBox não. Novela sem
+trailer é o caso comum — o campo fica ausente, nunca `null` nem inventado.
 
 ### `manifest.json`
 
@@ -92,7 +96,7 @@ exatamente assim — o resto é aditivo:
   "totalEpisodes": 40,
 
   // --- novo: nível da novela ---
-  "source": "tiktok",                    // "tiktok" | "reelshort" | "candyjar"
+  "source": "tiktok",                    // "tiktok" | "reelshort" | "candyjar" | "dramabox"
   "description": "Após prisão, Adeline Jenkins luta para pagar contas...",
   "poster": "poster.jpg",                // caminho relativo à pasta da novela
   "trailer": "trailer.mp4",              // ausente quando a novela não tem
@@ -199,6 +203,13 @@ análise. Por isso o bloco separado e nomeado.
 português é uma decisão editorial que acontece no painel do Noveleiras, com
 alguém olhando. Não traduza, não invente gênero: mande `key` e `value` como
 vieram. O `key` é o identificador estável.
+
+Uma ressalva sobre o DramaBox: ali o `value` **não** vem em inglês. A origem
+devolve o nome do tema no idioma da página pedida (`/pt/` responde
+`"Amor Proibido"`), e o único identificador estável entre idiomas é o `id`
+numérico, que vai no `key`. Continua valendo a regra: manda-se o que veio, sem
+traduzir nem inventar — só não se pode supor que o `value` seja inglês em
+todas as fontes.
 
 ---
 

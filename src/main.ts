@@ -17,7 +17,7 @@ interface Gear {
   urls: string[];
 }
 
-type SourceName = "tiktok" | "reelshort" | "candyjar";
+type SourceName = "tiktok" | "reelshort" | "candyjar" | "dramabox";
 
 interface Episode {
   number: number;
@@ -47,18 +47,20 @@ interface Series {
 }
 
 /** Espelha `Source::tag()` em media.rs — o id da tarefa leva a fonte no prefixo. */
-const SOURCE_TAG: Record<string, string> = { tiktok: "tk", reelshort: "rs", candyjar: "cj" };
+const SOURCE_TAG: Record<string, string> = {
+  tiktok: "tk",
+  reelshort: "rs",
+  candyjar: "cj",
+  dramabox: "db",
+};
 
 /** Espelha `Source::label()` em media.rs — usado so para textos da tela. */
 const SOURCE_LABEL: Record<string, string> = {
   tiktok: "TikTok",
   reelshort: "ReelShort",
   candyjar: "CandyJar",
+  dramabox: "DramaBox",
 };
-
-function taskId(source: string, dramaId: string, episode: number): string {
-  return `${SOURCE_TAG[source] ?? "tk"}:${dramaId}-${episode}`;
-}
 
 /** Da para baixar? Espelha `Episode::available()` no Rust. */
 function available(ep: Episode): boolean {
@@ -164,6 +166,19 @@ let settings: Settings = {
 let selected = new Set<number>();
 let freeBytes: number | null = null;
 
+/** Estado da visão de acompanhadas. Só de tela: nada disso vai para o backend. */
+type WatchFilter = "all" | "active" | "paused" | "error";
+let watchFilter: WatchFilter = "all";
+let watchQuery = "";
+
+/**
+ * O portão do agendador está fechado: a rede caiu e a fila parou de puxar
+ * tarefa nova de propósito. O backend anuncia as duas bordas por
+ * `queue://offline` — uma fila parada por queda precisa se distinguir de uma
+ * fila travada por defeito, e às 3h não há ninguém para diferenciar as duas.
+ */
+let offline = false;
+
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
 // ---------------------------------------------------------------- formatos
@@ -254,14 +269,47 @@ interface AuthEntry {
   label: string;
 }
 
+/**
+ * Um indicador para quatro contas.
+ *
+ * A barra de topo não é lugar para quatro estados que mudam uma vez por mês.
+ * O resumo diz só o que exige ação — "1 conta desconectada" — e o detalhe fica
+ * no modal, a um clique. Tudo conectado vira uma linha silenciosa, que é o
+ * caso normal.
+ */
+function renderAccountsChip(entries: Record<string, AuthEntry> | null) {
+  const chip = $("#accounts-chip");
+  const label = $("#accounts-label");
+  if (!entries) {
+    chip.className = "chip is-off";
+    label.textContent = "contas";
+    chip.title = "Não consegui ler as sessões. Clique para ver.";
+    return;
+  }
+  const todas = Object.values(entries);
+  const dentro = todas.filter((e) => e.logged);
+  const fora = todas.filter((e) => !e.logged);
+  if (fora.length === 0) {
+    chip.className = "chip is-on";
+    label.textContent = `${dentro.length} contas`;
+    chip.title = `Sessão ativa em: ${dentro.map((e) => e.label).join(", ")}.`;
+  } else {
+    chip.className = "chip is-off";
+    label.textContent = `${fora.length} fora`;
+    chip.title = `Sem sessão em: ${fora.map((e) => e.label).join(", ")}. Clique para entrar.`;
+  }
+}
+
 async function refreshAuth() {
   const chips: Array<[string, string, string]> = [
     ["tk", "#auth-chip", "#auth-label"],
     ["rs", "#auth-chip-rs", "#auth-label-rs"],
     ["cj", "#auth-chip-cj", "#auth-label-cj"],
+    ["db", "#auth-chip-db", "#auth-label-db"],
   ];
   try {
     const r = await invoke<Record<string, AuthEntry>>("auth_status");
+    renderAccountsChip(r);
     for (const [tag, chipSel, labelSel] of chips) {
       const entry = r[tag];
       const chip = $(chipSel);
@@ -289,6 +337,7 @@ async function refreshAuth() {
     }
   } catch (e) {
     // Nunca deixar o rotulo inicial preso: isso mente sobre o estado.
+    renderAccountsChip(null);
     for (const [, chipSel, labelSel] of chips) {
       const chip = $(chipSel);
       chip.className = "chip is-off";
@@ -357,7 +406,10 @@ async function saveSettings() {
 async function fetchSeries() {
   const url = $<HTMLInputElement>("#url-input").value.trim();
   if (!url) {
-    banner("Cole o link de uma novela do TikTok, do ReelShort ou do CandyJar primeiro.", "is-error");
+    banner(
+      "Cole o link de uma novela do TikTok, do ReelShort, do CandyJar ou do DramaBox primeiro.",
+      "is-error",
+    );
     return;
   }
   const btn = $<HTMLButtonElement>("#fetch-btn");
@@ -369,7 +421,33 @@ async function fetchSeries() {
     series = await invoke<Series>("fetch_series", { url });
     seriesUrl = url;
     selected = new Set();
+    // Antes de desenhar: a grade e o resumo dependem do que a pasta já tem.
+    await refreshOnDisk(series.name);
     renderSeries();
+
+    // O aviso que faltava. Colar o link de uma novela que já está no disco não
+    // pode parecer um começo do zero — e o caso mais comum é "tenho quase tudo,
+    // faltam dois".
+    // Os dois avisos abaixo podem valer ao mesmo tempo, e um `banner` sobrescreve
+    // o outro: juntá-los é o que impede o segundo de apagar o primeiro.
+    const avisos: string[] = [];
+    let tudoPronto = false;
+
+    if (onDisk.exists && onDisk.have.size) {
+      const faltam = missingEpisodes().length;
+      if (faltam === 0) {
+        tudoPronto = true;
+        avisos.push(
+          `"${series.name}" já está completa na pasta: ${onDisk.have.size} episódio(s). Nada a baixar.`,
+        );
+      } else {
+        avisos.push(
+          `Você já tem ${onDisk.have.size} episódio(s) de "${series.name}". Faltam ${faltam} — ` +
+            `"Baixar tudo" enfileira só esses e não toca no que já está lá.`,
+        );
+      }
+    }
+
     // O portão de direito do ReelShort e do CandyJar depende da sessão da
     // janela logada. Se sobrou episódio trancado, o motivo mais provável é
     // ela não ter sido capturada — dizer isso é melhor do que deixar o
@@ -377,14 +455,16 @@ async function fetchSeries() {
     if (series.source !== "tiktok" && series.episodes.some((e) => e.locked)) {
       const n = series.episodes.filter((e) => e.locked).length;
       const label = SOURCE_LABEL[series.source] ?? series.source;
-      banner(
+      avisos.push(
         `${n} episódio(s) ainda trancados. Se a sua conta libera eles, mantenha a janela do ${label} aberta e logada (chip lá em cima) e clique em Buscar de novo.`,
       );
     }
+
+    if (avisos.length) banner(avisos.join(" "), tudoPronto && avisos.length === 1 ? "is-ok" : "");
   } catch (e) {
     banner(String(e), "is-error");
     series = null;
-    $("#series-panel").hidden = true;
+    $("#series-modal").hidden = true;
   } finally {
     btn.disabled = false;
     btn.textContent = "Buscar";
@@ -399,8 +479,7 @@ function episodeSize(ep: Episode): number {
 
 function renderSeries() {
   if (!series) return;
-  const panel = $("#series-panel");
-  panel.hidden = false;
+  $("#series-modal").hidden = false;
 
   const cover = $<HTMLImageElement>("#series-cover");
   if (series.covers.length) {
@@ -419,27 +498,73 @@ function renderSeries() {
   // O ReelShort nao anuncia tamanho: melhor omitir do que mostrar "—" como se
   // fosse zero. O total aparece conforme os episodios baixam.
   const parts = [`${series.episodes.length} episódios`];
+  // O que já está na pasta vem primeiro depois do total: é a informação que
+  // decide se esta busca é um download novo ou um complemento.
+  if (onDisk.have.size) parts.push(`${onDisk.have.size} já na pasta`);
   if (total > 0) parts.push(bytes(total));
   if (locked) parts.push(`${locked} pago${locked > 1 ? "s" : ""}`);
   if (blocked) parts.push(`${blocked} bloqueado${blocked > 1 ? "s" : ""}`);
   $("#series-stats").textContent = parts.join(" · ");
 
+  // O botão dominante diz o que vai realmente acontecer. "Baixar tudo" numa
+  // novela da qual faltam 2 de 84 é uma promessa errada: o app não vai baixar
+  // 84, e dizer que vai é o que faz o usuário achar que baixou duas vezes.
+  const faltam = missingEpisodes().length;
+  const baixarTudo = $<HTMLButtonElement>("#download-all");
+  if (faltam === 0) {
+    baixarTudo.textContent = "Nada a baixar";
+    baixarTudo.disabled = true;
+    baixarTudo.title = "Todos os episódios liberados desta novela já estão na pasta.";
+  } else {
+    baixarTudo.disabled = false;
+    baixarTudo.textContent = onDisk.have.size ? `Baixar os ${faltam} que faltam` : "Baixar tudo";
+    baixarTudo.title = onDisk.have.size
+      ? `${onDisk.have.size} episódio(s) já estão na pasta e não serão baixados de novo.`
+      : "";
+  }
+  $<HTMLButtonElement>("#download-sequential").disabled = faltam === 0;
+
   renderPicker();
   updatePickSummary();
 }
 
-function haveIds(): Set<string> {
-  return new Set(tasks.filter((t) => t.status === "done").map((t) => t.id));
+/**
+ * Os episódios que já estão na pasta desta novela, lidos do disco.
+ *
+ * Antes isto vinha da fila ("tarefas concluídas"), que é memória do app e não
+ * verdade do disco: bastava *Limpar concluídos* para o app esquecer tudo,
+ * apagar os ✓ da grade e "Só os que faltam" voltar a marcar a série inteira.
+ * O disco não esquece.
+ */
+let onDisk: { dir: string; exists: boolean; have: Set<number> } = {
+  dir: "",
+  exists: false,
+  have: new Set(),
+};
+
+async function refreshOnDisk(nome: string) {
+  try {
+    const r = await invoke<{ dir: string; exists: boolean; have: number[] }>("series_on_disk", {
+      name: nome,
+    });
+    onDisk = { dir: r.dir, exists: r.exists, have: new Set(r.have) };
+  } catch {
+    // Sem leitura do disco a grade apenas deixa de marcar o que já existe. O
+    // `enqueue` continua conferindo a pasta do lado do Rust, então nada baixa
+    // duas vezes por causa disto.
+    onDisk = { dir: "", exists: false, have: new Set() };
+  }
 }
 
-function episodeKey(ep: Episode): string {
-  return taskId(series!.source, series!.drama_id, ep.number);
+/** Falta baixar? Um episódio bloqueado não conta como faltando. */
+function missingEpisodes(): Episode[] {
+  if (!series) return [];
+  return series.episodes.filter((ep) => available(ep) && !onDisk.have.has(ep.number));
 }
 
 function renderPicker() {
   if (!series) return;
   const grid = $("#ep-grid");
-  const have = haveIds();
   grid.innerHTML = "";
 
   for (const ep of series.episodes) {
@@ -456,7 +581,7 @@ function renderPicker() {
         ? `Episódio ${ep.number}: ${ep.lock_reason || "pago"} — desbloqueie na plataforma`
         : `Episódio ${ep.number}: sem mídia acessível`;
     } else {
-      if (have.has(episodeKey(ep))) b.classList.add("is-have");
+      if (onDisk.have.has(ep.number)) b.classList.add("is-have");
       if (selected.has(ep.number)) b.classList.add("is-sel");
       const size = episodeSize(ep);
       const detalhes = [`Episódio ${ep.number}`];
@@ -494,16 +619,54 @@ async function refreshFollows() {
   renderFollows();
 }
 
+/** Uma novela passa pelo filtro e pela busca atuais? */
+function matchesWatch(f: Follow): boolean {
+  if (watchQuery && !f.name.toLowerCase().includes(watchQuery)) return false;
+  switch (watchFilter) {
+    case "active":
+      return !f.paused && !f.error;
+    case "paused":
+      return f.paused;
+    case "error":
+      return Boolean(f.error);
+    default:
+      return true;
+  }
+}
+
 function renderFollows() {
-  const panel = $("#watch-panel");
-  panel.hidden = follows.length === 0;
   $("#watch-next").textContent = settings.auto_enabled
     ? `verificando a cada ${settings.auto_interval_hours}h`
     : "verificação automática desligada";
 
+  const visiveis = follows.filter(matchesWatch);
+
+  // Dois vazios diferentes, e a diferença importa: não acompanhar nada é o
+  // primeiro uso e pede uma instrução; filtrar até sobrar nada é um filtro que
+  // pede para ser afrouxado. Um texto só mentiria num dos dois casos.
+  const vazio = $("#watch-empty");
+  vazio.hidden = visiveis.length > 0;
+  if (follows.length === 0) {
+    vazio.querySelector<HTMLElement>(".empty-title")!.textContent = "Nada sendo acompanhado ainda";
+    vazio.querySelector<HTMLElement>(".empty-hint")!.innerHTML =
+      'Busque uma novela e clique em <strong>Acompanhar</strong>. A partir daí o ' +
+      "app revisita ela sozinho e baixa o episódio novo assim que ele existe.";
+  } else if (visiveis.length === 0) {
+    vazio.querySelector<HTMLElement>(".empty-title")!.textContent = "Nenhuma novela com esse filtro";
+    vazio.querySelector<HTMLElement>(".empty-hint")!.textContent =
+      `${follows.length} novela(s) acompanhada(s) — mude o filtro ou limpe a busca.`;
+  }
+
+  $("#watch-count").textContent = follows.length
+    ? visiveis.length === follows.length
+      ? `${follows.length}`
+      : `${visiveis.length} de ${follows.length}`
+    : "";
+  $("#tab-watch-count").textContent = follows.length ? String(follows.length) : "";
+
   const list = $("#watch-list");
   list.textContent = "";
-  for (const f of follows) {
+  for (const f of visiveis) {
     const row = document.createElement("div");
     row.className = "watch-row" + (f.paused ? " is-paused" : "");
     row.setAttribute("role", "listitem");
@@ -593,6 +756,246 @@ async function runWatchNow() {
   } finally {
     btn.disabled = false;
     btn.textContent = "Verificar agora";
+  }
+}
+
+// ------------------------------------------------------------------- lote
+
+/** Espelha `bulk::Candidate` — o que dá para saber de um link sem gastar rede. */
+interface Candidate {
+  url: string;
+  source: SourceName | null;
+  drama_id: string | null;
+  following: boolean;
+}
+
+/** Espelha `bulk::Outcome`. */
+interface BulkOutcome {
+  url: string;
+  name: string;
+  source: SourceName | null;
+  episodes: number;
+  /** Episódios que já estavam na pasta e não foram baixados de novo. */
+  already: number;
+  followed: boolean;
+  error: string | null;
+}
+
+/** Espelha `bulk::Report`. */
+interface BulkReport {
+  total: number;
+  ok: number;
+  failed: number;
+  episodes: number;
+  /** Episódios do lote inteiro que já estavam no disco. */
+  already: number;
+  followed: number;
+  cancelled: boolean;
+  /** Por que a rodada parou sozinha (piso de disco), quando parou. */
+  stopped: string | null;
+  outcomes: BulkOutcome[];
+}
+
+/** Espelha o `PACE` de bulk.rs — usado só para estimar o tempo na tela. */
+const BULK_PACE_SECS = 20;
+
+let candidates: Candidate[] = [];
+let bulkRunning = false;
+
+/** Só os que o app sabe processar. Link não reconhecido fica listado, mas fora. */
+function usableCandidates(): Candidate[] {
+  return candidates.filter((c) => c.source !== null);
+}
+
+/**
+ * Relê a caixa e reconta, sem rede.
+ *
+ * Roda a cada tecla porque a resposta é local e instantânea: ver o número subir
+ * enquanto cola é o que dá confiança de que a lista inteira foi entendida.
+ */
+async function previewBulk() {
+  const text = $<HTMLTextAreaElement>("#bulk-input").value;
+  const summary = $("#bulk-summary");
+  const list = $("#bulk-list");
+  const run = $<HTMLButtonElement>("#bulk-run");
+
+  if (!text.trim()) {
+    candidates = [];
+    summary.hidden = true;
+    list.hidden = true;
+    run.disabled = true;
+    $("#bulk-eta").textContent = "";
+    return;
+  }
+
+  try {
+    candidates = await invoke<Candidate[]>("bulk_preview", { text });
+  } catch (e) {
+    banner(String(e), "is-error");
+    return;
+  }
+
+  const uteis = usableCandidates();
+  const novos = uteis.filter((c) => !c.following);
+  const jaSeguidas = uteis.length - novos.length;
+  const desconhecidos = candidates.length - uteis.length;
+
+  // Por fonte: uma lista de 40 vinda de lugares diferentes só faz sentido se
+  // der para conferir que cada plataforma trouxe o que devia.
+  const porFonte = new Map<string, number>();
+  for (const c of uteis) {
+    const nome = SOURCE_LABEL[c.source!] ?? c.source!;
+    porFonte.set(nome, (porFonte.get(nome) ?? 0) + 1);
+  }
+
+  const partes = [`${uteis.length} novela${uteis.length === 1 ? "" : "s"}`];
+  if (porFonte.size) {
+    partes.push([...porFonte].map(([n, q]) => `${q} do ${n}`).join(" · "));
+  }
+  if (jaSeguidas) partes.push(`${jaSeguidas} já acompanhada${jaSeguidas > 1 ? "s" : ""}`);
+  if (desconhecidos) partes.push(`${desconhecidos} link(s) não reconhecido(s)`);
+  summary.textContent = partes.join(" · ");
+  summary.hidden = false;
+
+  list.textContent = "";
+  for (const c of candidates) {
+    const li = document.createElement("li");
+    li.className = "bulk-item";
+    const tag = document.createElement("span");
+    tag.className = "bulk-tag";
+    if (c.source) {
+      tag.textContent = SOURCE_LABEL[c.source] ?? c.source;
+    } else {
+      tag.textContent = "?";
+      tag.classList.add("is-unknown");
+      li.classList.add("is-unknown");
+    }
+    const link = document.createElement("span");
+    link.className = "bulk-url";
+    link.textContent = c.url;
+    link.title = c.url;
+    li.append(tag, link);
+    if (c.following) {
+      const nota = document.createElement("span");
+      nota.className = "bulk-note";
+      nota.textContent = "já acompanhada";
+      li.append(nota);
+    }
+    list.append(li);
+  }
+  list.hidden = candidates.length === 0;
+
+  run.disabled = uteis.length === 0 || bulkRunning;
+  run.textContent = uteis.length
+    ? `Adicionar ${uteis.length} novela${uteis.length > 1 ? "s" : ""}`
+    : "Adicionar";
+  // O tempo é a informação que evita a pergunta "travou?". Ele é dominado pela
+  // espera entre consultas, não pelo download.
+  $("#bulk-eta").textContent = uteis.length
+    ? `consulta leva ~${duration(Math.max(0, uteis.length - 1) * BULK_PACE_SECS)}`
+    : "";
+}
+
+function setBulkBusy(busy: boolean) {
+  bulkRunning = busy;
+  $<HTMLButtonElement>("#bulk-run").disabled = busy || usableCandidates().length === 0;
+  $<HTMLButtonElement>("#bulk-run").textContent = busy ? "Adicionando..." : "Adicionar";
+  $("#bulk-cancel").hidden = !busy;
+  $("#bulk-progress").hidden = !busy;
+  $<HTMLTextAreaElement>("#bulk-input").disabled = busy;
+  if (busy) $("#bulk-report").hidden = true;
+  else previewBulk();
+}
+
+function renderBulkReport(r: BulkReport) {
+  const box = $("#bulk-report");
+  box.textContent = "";
+
+  const linha = document.createElement("p");
+  linha.className = "bulk-report-head";
+  const partes = [
+    `${r.ok} de ${r.total} adicionada${r.total > 1 ? "s" : ""}`,
+  ];
+  if (r.episodes) partes.push(`${r.episodes} episódio(s) na fila`);
+  // Sem esta linha, um lote de novelas que você já tem apareceria como
+  // "0 episódios" e pareceria falha — quando é exatamente o resultado certo.
+  if (r.already) partes.push(`${r.already} já estavam na pasta`);
+  if (r.followed) partes.push(`${r.followed} acompanhada(s)`);
+  if (r.cancelled) partes.push("rodada cancelada");
+  linha.textContent = partes.join(" · ");
+  box.append(linha);
+
+  // Uma rodada que parou sozinha tem de dizer por quê no lugar mais visível:
+  // sem isso, "12 de 40" pareceria falha de rede em vez de disco no limite.
+  if (r.stopped) {
+    const parada = document.createElement("p");
+    parada.className = "setting-hint is-error-text";
+    parada.textContent = r.stopped;
+    box.append(parada);
+  }
+
+  // Só o que falhou vira lista: acertos em massa não precisam ser enumerados,
+  // e enumerá-los esconderia justamente as falhas no meio.
+  const falhas = r.outcomes.filter((o) => o.error);
+  if (falhas.length) {
+    const titulo = document.createElement("p");
+    titulo.className = "setting-hint";
+    titulo.textContent = `${falhas.length} não entrou/entraram:`;
+    box.append(titulo);
+    const ul = document.createElement("ul");
+    ul.className = "bulk-list";
+    for (const f of falhas) {
+      const li = document.createElement("li");
+      li.className = "bulk-item is-fail";
+      const nome = document.createElement("span");
+      nome.className = "bulk-url";
+      nome.textContent = f.name || f.url;
+      nome.title = f.url;
+      const err = document.createElement("span");
+      err.className = "bulk-note is-error-text";
+      err.textContent = f.error ?? "";
+      li.append(nome, err);
+      ul.append(li);
+    }
+    box.append(ul);
+  }
+  box.hidden = false;
+}
+
+async function runBulk() {
+  const urls = usableCandidates().map((c) => c.url);
+  if (!urls.length) return;
+
+  const options = {
+    download: $<HTMLInputElement>("#bulk-download").checked,
+    follow: $<HTMLInputElement>("#bulk-follow").checked,
+  };
+  if (!options.download && !options.follow) {
+    banner("Marque pelo menos uma das duas ações do lote.", "is-error");
+    return;
+  }
+
+  setBulkBusy(true);
+  $("#bulk-bar").setAttribute("style", "width:0%");
+  $("#bulk-progress-text").textContent = `preparando ${urls.length} novela(s)...`;
+
+  try {
+    const r = await invoke<BulkReport>("bulk_add", { urls, options });
+    renderBulkReport(r);
+    const resumo =
+      `Lote: ${r.ok} de ${r.total} adicionada(s), ${r.episodes} episódio(s) na fila` +
+      (r.already ? `, ${r.already} já estavam na pasta.` : ".");
+    banner(r.stopped ? `${resumo} ${r.stopped}` : resumo, r.failed || r.stopped ? "is-error" : "is-ok");
+    // A caixa esvazia só no sucesso total: com falhas — ou com uma rodada que
+    // parou no meio — o texto continua ali para o usuário reprocessar o que
+    // sobrou sem ter de recolher os links de novo.
+    if (!r.failed && !r.cancelled && !r.stopped) $<HTMLTextAreaElement>("#bulk-input").value = "";
+    await refreshFollows();
+    await refreshQueue();
+  } catch (e) {
+    banner(String(e), "is-error");
+  } finally {
+    setBulkBusy(false);
   }
 }
 
@@ -930,12 +1333,21 @@ function renderStatusBar() {
   ).length;
 
   const parts: string[] = [];
+  // Sem conexão o rodapé tem de dizer isso antes de qualquer número: "0
+  // baixando · 400 na fila" parece o app travado, quando é o app esperando
+  // corretamente a internet voltar.
+  if (offline) parts.push("sem conexão — esperando a internet voltar");
   if (running.length) parts.push(`${running.length} baixando`);
   if (queued - retrying > 0) parts.push(`${queued - retrying} na fila`);
   if (retrying) parts.push(`${retrying} tentando de novo`);
   if (done) parts.push(`${done} pronto${done > 1 ? "s" : ""}`);
   if (failed) parts.push(`${failed} com falha`);
   $("#stat-counts").textContent = parts.join(" · ") || "ocioso";
+
+  // A aba responde "como está a fila?" mesmo com a outra visão aberta — que é
+  // a primeira pergunta ao abrir o app.
+  const pendentes = running.length + queued;
+  $("#tab-queue-count").textContent = pendentes ? String(pendentes) : "";
 
   const total = running.reduce((s, t) => s + num(t.speed), 0);
   $("#stat-speed").textContent = speed(total);
@@ -987,6 +1399,64 @@ async function refreshDisk() {
   }
 }
 
+// ------------------------------------------------------------------ visoes
+
+/**
+ * Troca a visão sem desmontar nada.
+ *
+ * `hidden`, nunca remoção: o render da fila reconcilia as linhas por chave e
+ * guarda as referências dos filhos. Tirar `#queue-list` do documento deixaria
+ * o mapa cheio de nós órfãos e a fila voltaria a congelar — o defeito mais
+ * caro que este app já teve.
+ */
+function showView(which: "queue" | "watch") {
+  const abas: Array<["queue" | "watch", string, string]> = [
+    ["queue", "#tab-queue", "#view-queue"],
+    ["watch", "#tab-watch", "#view-watch"],
+  ];
+  for (const [nome, tabSel, viewSel] of abas) {
+    const ativa = nome === which;
+    const tab = $(tabSel);
+    tab.classList.toggle("is-active", ativa);
+    tab.setAttribute("aria-selected", String(ativa));
+    $(viewSel).hidden = !ativa;
+  }
+}
+
+/**
+ * A conta que decide se "durmo e acordo com tudo baixado" é verdade.
+ *
+ * Com 20s entre uma novela e outra, o teto de séries por rodada vira minutos de
+ * verificação — e nenhum desses dois números aparece junto do outro em lugar
+ * nenhum. Sem esta linha, os limites se ajustam no escuro.
+ */
+function renderAutoMath(s: Settings = settings) {
+  const el = $("#auto-math");
+  if (!s.auto_enabled) {
+    el.textContent = "Com a verificação desligada, nada entra na fila sozinho.";
+    return;
+  }
+  const teto = s.auto_max_new_series;
+  const alvo = teto > 0 ? Math.min(teto, follows.length) : follows.length;
+  if (alvo === 0) {
+    el.textContent = "Nenhuma novela acompanhada ainda — a rodada não tem o que verificar.";
+    return;
+  }
+  // 20s entre uma e outra, sem espera depois da última: é o mesmo ritmo do
+  // watch.rs, e é ele que domina o tempo da rodada.
+  const consulta = duration(Math.max(0, alvo - 1) * 20);
+  const partes = [
+    `Cada rodada verifica ${alvo} de ${follows.length} novela(s) — cerca de ${consulta} só de consulta`,
+  ];
+  if (teto > 0 && follows.length > teto) {
+    partes.push(`as ${follows.length - teto} restantes ficam para a rodada seguinte`);
+  }
+  if (s.auto_max_gb_per_run > 0) {
+    partes.push(`e a rodada para ao enfileirar ${s.auto_max_gb_per_run} GB`);
+  }
+  el.textContent = `${partes.join(", ")}.`;
+}
+
 // ------------------------------------------------------------------ eventos
 
 function wire() {
@@ -994,6 +1464,37 @@ function wire() {
   $("#url-input").addEventListener("keydown", (e) => {
     if ((e as KeyboardEvent).key === "Enter") fetchSeries();
   });
+
+  // Navegação entre visões.
+  $("#tab-queue").addEventListener("click", () => showView("queue"));
+  $("#tab-watch").addEventListener("click", () => showView("watch"));
+
+  // Contas.
+  $("#accounts-chip").addEventListener("click", () => {
+    $("#accounts-modal").hidden = false;
+    refreshAuth();
+  });
+  $("#close-accounts").addEventListener("click", () => {
+    $("#accounts-modal").hidden = true;
+  });
+  $("#accounts-modal").addEventListener("click", (e) => {
+    if (e.target === $("#accounts-modal")) $("#accounts-modal").hidden = true;
+  });
+
+  // Busca e filtro das acompanhadas.
+  $("#watch-search").addEventListener("input", (e) => {
+    watchQuery = (e.target as HTMLInputElement).value.trim().toLowerCase();
+    renderFollows();
+  });
+  for (const btn of document.querySelectorAll<HTMLElement>("[data-watch-filter]")) {
+    btn.addEventListener("click", () => {
+      watchFilter = btn.dataset.watchFilter as WatchFilter;
+      for (const outro of document.querySelectorAll<HTMLElement>("[data-watch-filter]")) {
+        outro.classList.toggle("is-active", outro === btn);
+      }
+      renderFollows();
+    });
+  }
 
   $("#auth-chip").addEventListener("click", async () => {
     await invoke("open_login", { source: "tiktok" });
@@ -1007,19 +1508,27 @@ function wire() {
     await invoke("open_login", { source: "candyjar" });
     banner("Entre na sua conta do CandyJar na janela que abriu, depois volte aqui.");
   });
+  $("#auth-chip-db").addEventListener("click", async () => {
+    await invoke("open_login", { source: "dramabox" });
+    banner("Entre na sua conta do DramaBox na janela que abriu, depois volte aqui.");
+  });
 
   $("#series-close").addEventListener("click", () => {
-    $("#series-panel").hidden = true;
+    $("#series-modal").hidden = true;
     series = null;
   });
 
+  // Só o que falta. O `enqueue` do Rust já recusaria o que está no disco, mas
+  // enfileirar 84 para 82 virarem "concluído" no mesmo instante enche a fila de
+  // linhas que não são trabalho — e com cinquenta novelas isso é a fila inteira
+  // virando ruído.
   $("#download-all").addEventListener("click", () => {
     if (!series) return;
-    enqueue(series.episodes.filter(available).map((e) => e.number));
+    enqueue(missingEpisodes().map((e) => e.number));
   });
   $("#download-sequential").addEventListener("click", () => {
     if (!series) return;
-    enqueue(series.episodes.filter(available).map((e) => e.number), 1, true);
+    enqueue(missingEpisodes().map((e) => e.number), 1, true);
   });
 
   $("#follow-series").addEventListener("click", followCurrent);
@@ -1045,14 +1554,7 @@ function wire() {
       if (kind === "all") setSelection(new Set(usable.map((e) => e.number)));
       else if (kind === "none") setSelection(new Set());
       else if (kind === "missing") {
-        const have = haveIds();
-        setSelection(
-          new Set(
-            usable
-              .filter((e) => !have.has(episodeKey(e)))
-              .map((e) => e.number),
-          ),
-        );
+        setSelection(new Set(missingEpisodes().map((e) => e.number)));
       }
     });
   }
@@ -1152,10 +1654,69 @@ function wire() {
     invoke("open_path", { path: settings.dest_dir }),
   );
 
+  // Lote.
+  $("#open-bulk").addEventListener("click", () => {
+    $("#bulk-modal").hidden = false;
+    $<HTMLTextAreaElement>("#bulk-input").focus();
+    previewBulk();
+  });
+  const closeBulk = () => {
+    // Fechar durante a rodada não a cancela: ela continua no backend e o
+    // relatório volta pelo banner. Cancelar é um botão explícito.
+    $("#bulk-modal").hidden = true;
+  };
+  $("#close-bulk").addEventListener("click", closeBulk);
+  $("#bulk-modal").addEventListener("click", (e) => {
+    if (e.target === $("#bulk-modal")) closeBulk();
+  });
+  // Uma colagem é um evento só, mas editar dentro de uma caixa com centenas de
+  // links seria uma ida ao backend por tecla — e cada ida reescaneia o texto
+  // inteiro e clona a lista de acompanhadas. O atraso é curto o bastante para
+  // continuar parecendo instantâneo.
+  let previewTimer = 0;
+  $("#bulk-input").addEventListener("input", () => {
+    clearTimeout(previewTimer);
+    previewTimer = window.setTimeout(previewBulk, 150);
+  });
+  $("#bulk-run").addEventListener("click", runBulk);
+  $("#bulk-cancel").addEventListener("click", async () => {
+    await invoke("bulk_cancel");
+    $("#bulk-progress-text").textContent = "cancelando após a novela atual...";
+  });
+
   // Ajustes.
   $("#open-settings").addEventListener("click", () => {
     $("#settings-modal").hidden = false;
+    renderAutoMath();
   });
+  for (const btn of document.querySelectorAll<HTMLElement>("[data-settings-tab]")) {
+    btn.addEventListener("click", () => {
+      const alvo = btn.dataset.settingsTab;
+      for (const outro of document.querySelectorAll<HTMLElement>("[data-settings-tab]")) {
+        const ativa = outro === btn;
+        outro.classList.toggle("is-active", ativa);
+        outro.setAttribute("aria-selected", String(ativa));
+      }
+      for (const pane of document.querySelectorAll<HTMLElement>("[data-settings-pane]")) {
+        pane.hidden = pane.dataset.settingsPane !== alvo;
+      }
+      if (alvo === "auto") renderAutoMath();
+    });
+  }
+  // A conta da rodada muda com o que se digita, não só ao salvar: é ajustando
+  // que se quer ver o efeito.
+  for (const sel of ["#set-auto", "#set-auto-series", "#set-auto-gb", "#set-auto-interval"]) {
+    $(sel).addEventListener("input", () => {
+      const atual: Settings = {
+        ...settings,
+        auto_enabled: $<HTMLInputElement>("#set-auto").checked,
+        auto_interval_hours: num(Number($<HTMLInputElement>("#set-auto-interval").value)),
+        auto_max_new_series: num(Number($<HTMLInputElement>("#set-auto-series").value)),
+        auto_max_gb_per_run: num(Number($<HTMLInputElement>("#set-auto-gb").value)),
+      };
+      renderAutoMath(atual);
+    });
+  }
   $("#close-settings").addEventListener("click", () => {
     $("#settings-modal").hidden = true;
   });
@@ -1175,8 +1736,22 @@ function wire() {
     if (typeof dir === "string") $<HTMLInputElement>("#set-dest").value = dir;
   });
 
+  // Fechar por clique no fundo: o mesmo gesto vale para todos os modais.
+  $("#series-modal").addEventListener("click", (e) => {
+    if (e.target === $("#series-modal")) $("#series-modal").hidden = true;
+  });
+
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") $("#settings-modal").hidden = true;
+    if (e.key !== "Escape") return;
+    // Fecha só o de cima: com quatro modais, um Esc que fecha tudo apaga
+    // trabalho que ainda estava aberto atrás.
+    for (const sel of ["#settings-modal", "#accounts-modal", "#bulk-modal", "#series-modal"]) {
+      const modal = $(sel);
+      if (!modal.hidden) {
+        modal.hidden = true;
+        return;
+      }
+    }
   });
 
   window.addEventListener("focus", refreshAuth);
@@ -1215,6 +1790,20 @@ async function main() {
     }
   });
 
+  // O lote também espera 20s entre uma novela e outra: sem dizer em qual está,
+  // a janela ficaria um quarto de hora parecendo travada.
+  await listen<{ done: number; total: number; url: string; name: string; eta_secs: number }>(
+    "bulk://progress",
+    (e) => {
+      const { done, total, url, name, eta_secs } = e.payload;
+      const pct = total > 0 ? (done / total) * 100 : 0;
+      $("#bulk-bar").setAttribute("style", `width:${pct.toFixed(1)}%`);
+      $("#bulk-progress-text").textContent =
+        `${Math.min(done + 1, total)}/${total} — ${name || url}` +
+        (eta_secs > 0 ? ` · faltam ~${duration(eta_secs)}` : "");
+    },
+  );
+
   // A varredura de metadados espera 20s entre uma novela e outra. Sem mostrar
   // em qual pasta esta, o botao ficaria minutos parado parecendo travado.
   await listen<{ done: number; total: number; folder: string }>("meta://progress", (e) => {
@@ -1222,12 +1811,53 @@ async function main() {
     $("#meta-status").textContent = folder ? `${done + 1}/${total} — ${folder}` : "";
   });
 
+  // Queda e volta da internet. A fila não trava: ela espera, e volta sozinha.
+  await listen<boolean>("queue://offline", (e) => {
+    offline = e.payload;
+    if (offline) {
+      banner(
+        "Sem conexão. A fila pausou sozinha e volta assim que a internet voltar — nada foi perdido.",
+        "is-error",
+      );
+    }
+    renderQueue();
+  });
+  await listen<boolean>("queue://online", () => {
+    offline = false;
+    banner("Conexão de volta. A fila retomou de onde parou.", "is-ok");
+    refreshQueue();
+  });
+  // O zelador devolveu à fila o que tinha falhado por motivo passageiro.
+  await listen<number>("queue://revived", (e) => {
+    if (e.payload > 0) {
+      banner(`${e.payload} download(s) que tinham falhado voltaram a tentar sozinhos.`, "is-ok");
+      refreshQueue();
+    }
+  });
+
   // O backend transmite a fila enquanto algo esta rodando.
   let lastEvent = Date.now();
+  // Quantos episódios da novela aberta já terminaram, para saber quando a
+  // pasta mudou. Sem isto, o modal continua marcando o estado de antes do
+  // download: os ✓ da grade e o "Baixar os N que faltam" ficariam velhos até
+  // o usuário buscar a novela de novo — a mesma amnésia que o disco resolveu
+  // do outro lado.
+  let concluidosDaSerie = -1;
   await listen<Task[]>("queue://update", (e) => {
     lastEvent = Date.now();
     tasks = e.payload;
     renderQueue();
+
+    if (!series || $("#series-modal").hidden) return;
+    const prontos = tasks.filter(
+      (t) => t.status === "done" && t.drama_id === series!.drama_id && t.source === series!.source,
+    ).length;
+    if (prontos !== concluidosDaSerie) {
+      concluidosDaSerie = prontos;
+      refreshOnDisk(series.name).then(() => {
+        if (series) renderSeries();
+      });
+    }
   });
 
   // Vigia: se o fluxo de eventos parar (listener perdido, webview suspenso ao

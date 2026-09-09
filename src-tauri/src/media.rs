@@ -18,10 +18,16 @@ pub enum Source {
     Tiktok,
     Reelshort,
     Candyjar,
+    Dramabox,
 }
 
 /// Todas as fontes, para varrer estado por fonte sem esquecer nenhuma.
-pub const SOURCES: [Source; 3] = [Source::Tiktok, Source::Reelshort, Source::Candyjar];
+pub const SOURCES: [Source; 4] = [
+    Source::Tiktok,
+    Source::Reelshort,
+    Source::Candyjar,
+    Source::Dramabox,
+];
 
 impl Source {
     /// Prefixo do id da tarefa. Sem ele, um `book_id` do ReelShort e um
@@ -32,6 +38,7 @@ impl Source {
             Source::Tiktok => "tk",
             Source::Reelshort => "rs",
             Source::Candyjar => "cj",
+            Source::Dramabox => "db",
         }
     }
 
@@ -45,6 +52,7 @@ impl Source {
             Source::Tiktok => "TikTok",
             Source::Reelshort => "ReelShort",
             Source::Candyjar => "CandyJar",
+            Source::Dramabox => "DramaBox",
         }
     }
 
@@ -54,6 +62,10 @@ impl Source {
             Source::Tiktok => "https://www.tiktok.com/login",
             Source::Reelshort => "https://www.reelshort.com/profile",
             Source::Candyjar => "https://candyjar.com/profile",
+            // O DramaBox nao tem rota propria de login nem de perfil
+            // (`/login`, `/profile` e `/my` respondem 404): a entrada e um
+            // modal aberto a partir da home.
+            Source::Dramabox => "https://www.dramabox.com/",
         }
     }
 
@@ -63,6 +75,7 @@ impl Source {
             Source::Tiktok => "tiktok",
             Source::Reelshort => "reelshort",
             Source::Candyjar => "candyjar",
+            Source::Dramabox => "dramabox",
         }
     }
 
@@ -74,6 +87,7 @@ impl Source {
             Source::Tiktok => "login",
             Source::Reelshort => "login-reelshort",
             Source::Candyjar => "login-candyjar",
+            Source::Dramabox => "login-dramabox",
         }
     }
 
@@ -87,6 +101,7 @@ impl Source {
             Source::Tiktok => Some("sessionid"),
             Source::Reelshort => None,
             Source::Candyjar => None,
+            Source::Dramabox => None,
         }
     }
 }
@@ -288,6 +303,13 @@ pub fn series_url(source: Source, drama_id: &str, lang: &str) -> String {
         Source::Candyjar => {
             let lang = if lang.is_empty() { "en" } else { lang };
             format!("https://candyjar.com/{lang}/series/{drama_id}")
+        }
+        // O slug e o id do episodio que aparecem na URL copiada do player sao
+        // decorativos: `/{lang}/video/{bookId}` devolve a mesma pagina inteira.
+        // Verificado contra o site.
+        Source::Dramabox => {
+            let lang = if lang.is_empty() { "en" } else { lang };
+            format!("https://www.dramabox.com/{lang}/video/{drama_id}")
         }
     }
 }

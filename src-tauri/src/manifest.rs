@@ -388,6 +388,7 @@ fn referer(source: Source) -> &'static str {
         Source::Tiktok => "https://www.tiktok.com/",
         Source::Reelshort => "https://www.reelshort.com/",
         Source::Candyjar => "https://candyjar.com/",
+        Source::Dramabox => "https://www.dramabox.com/",
     }
 }
 
@@ -482,6 +483,7 @@ pub fn patch_series(m: &mut Manifest, s: &Series, poster: Option<String>) {
         Source::Tiktok => "tiktok",
         Source::Reelshort => "reelshort",
         Source::Candyjar => "candyjar",
+        Source::Dramabox => "dramabox",
     }
     .into();
     m.source_url = s.url();
@@ -578,9 +580,26 @@ pub fn patch_episode(m: &mut Manifest, number: u32, entry: EpisodeEntry) {
 /// downloader teria escrito: uma serie do ReelShort pode ter sido convertida de
 /// `.ts` para `.mp4` depois. Procura pelo numero, que e a identidade estavel.
 pub fn episode_file(dir: &Path, number: u32) -> Option<String> {
+    episode_files(dir).remove(&number)
+}
+
+/// Todos os episodios com arquivo de video nesta pasta, numa varredura so.
+///
+/// Uma serie tem 40 a 90 episodios. Perguntar `episode_file` por numero leria o
+/// diretorio uma vez por episodio — noventa varreduras para responder a mesma
+/// pergunta. Quem precisa saber "o que ja tenho" pergunta a pasta inteira de
+/// uma vez.
+///
+/// Preferencia por `.mp4` quando o mesmo numero aparece em mais de um formato:
+/// e o arquivo que o app publica, e o `.ts` legado so sobrevive ate a
+/// normalizacao passar.
+pub fn episode_files(dir: &Path) -> std::collections::BTreeMap<u32, String> {
     const VIDEO: [&str; 7] = ["mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts"];
-    let mut matches = Vec::new();
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
+    let mut achados: std::collections::BTreeMap<u32, Vec<String>> = Default::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Default::default();
+    };
+    for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         let lower = name.to_ascii_lowercase();
         let Some((stem, ext)) = lower.rsplit_once('.') else {
@@ -591,16 +610,21 @@ pub fn episode_file(dir: &Path, number: u32) -> Option<String> {
         }
         // Um `.parcial.mp4` abandonado por uma queda tem extensao de video e
         // numero de episodio; nunca pode virar entrada de manifesto nem fonte
-        // de normalizacao.
+        // de normalizacao — nem contar como "ja tenho".
         if is_temp_stem(stem) {
             continue;
         }
-        if number_in_stem(stem) == Some(number) {
-            matches.push(name);
+        if let Some(n) = number_in_stem(stem) {
+            achados.entry(n).or_default().push(name);
         }
     }
-    matches.sort_by_key(|name| if name.to_ascii_lowercase().ends_with(".mp4") { 0 } else { 1 });
-    matches.into_iter().next()
+    achados
+        .into_iter()
+        .map(|(n, mut nomes)| {
+            nomes.sort_by_key(|name| if name.to_ascii_lowercase().ends_with(".mp4") { 0 } else { 1 });
+            (n, nomes.remove(0))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------- trailer
@@ -664,7 +688,9 @@ pub async fn ensure_trailer(
             )
             .await?
         }
-        Source::Tiktok => return Ok(None),
+        // Nenhuma das duas publica video de apresentacao: `series.trailer` ja
+        // vem `None`, e chegar aqui so aconteceria com um manifesto inventado.
+        Source::Tiktok | Source::Dramabox => return Ok(None),
     };
     match outcome {
         crate::download::Outcome::Done(_) => {
@@ -1100,6 +1126,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A varredura de pasta inteira responde o mesmo que perguntar um a um.
+    ///
+    /// E ela que sustenta o "nunca baixa o mesmo episodio duas vezes": quem
+    /// enfileira consulta a pasta por NUMERO, e nao pelo nome que o downloader
+    /// escreveria hoje. Um arquivo renomeado, ou vindo de quando a novela tinha
+    /// outro nome, continua contando como "ja tenho".
+    #[test]
+    fn a_varredura_da_pasta_acha_o_episodio_mesmo_renomeado() {
+        let dir = dir_de_teste("varredura");
+        std::fs::write(dir.join("Novela X - E01.mp4"), b"v").unwrap();
+        // Nome antigo da mesma novela: o numero e a identidade estavel.
+        std::fs::write(dir.join("Titulo Antigo - E02.mp4"), b"v").unwrap();
+        // Legado ainda nao normalizado.
+        std::fs::write(dir.join("Novela X - E03.ts"), b"v").unwrap();
+        // Interrompido: nao conta.
+        std::fs::write(dir.join("Novela X - E04.parcial.mp4"), b"v").unwrap();
+        std::fs::write(dir.join("poster.jpg"), b"i").unwrap();
+
+        let achados = episode_files(&dir);
+        assert_eq!(achados.get(&1).map(String::as_str), Some("Novela X - E01.mp4"));
+        assert_eq!(achados.get(&2).map(String::as_str), Some("Titulo Antigo - E02.mp4"));
+        assert_eq!(achados.get(&3).map(String::as_str), Some("Novela X - E03.ts"));
+        assert_eq!(achados.get(&4), None);
+        assert_eq!(achados.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mesmo numero em dois formatos: vence o MP4, que e o que o app publica.
+    #[test]
+    fn entre_mp4_e_ts_do_mesmo_episodio_vence_o_mp4() {
+        let dir = dir_de_teste("varredura-dupla");
+        std::fs::write(dir.join("Novela X - E07.ts"), b"v").unwrap();
+        std::fs::write(dir.join("Novela X - E07.mp4"), b"v").unwrap();
+
+        assert_eq!(
+            episode_files(&dir).get(&7).map(String::as_str),
+            Some("Novela X - E07.mp4")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pasta que nao existe nao e erro: e uma novela que nunca foi baixada.
+    #[test]
+    fn pasta_inexistente_devolve_vazio_sem_estourar() {
+        let dir = std::env::temp_dir().join("tkdrama-nao-existe-mesmo");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(episode_files(&dir).is_empty());
+    }
+
     /// Trailer so conta quando e MP4 valido no disco. Um arquivo com o nome
     /// certo mas conteudo quebrado nao vira campo no manifesto.
     #[tokio::test]
@@ -1230,6 +1307,110 @@ mod tests {
         assert_eq!(v["trailer"], "trailer.mp4");
         assert_eq!(v["episodes"]["1"]["thumb"], format!("{THUMBS_DIR}/E01.jpg"));
         assert_eq!(v["episodes"]["1"]["locked"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ponta a ponta contra o site de verdade: capa, miniatura, download real
+    /// do episodio 1 e manifesto final — o DramaBox no mesmo formato que as
+    /// outras fontes. Diferente do CandyJar, aqui o video e MP4 progressivo e
+    /// desce pelo `download_episode`, o caminho do TikTok; e o unico jeito de
+    /// provar que a fonte nova foi ligada no downloader certo.
+    /// Marcado `ignore`: rede + FFmpeg.
+    #[tokio::test]
+    #[ignore]
+    async fn dramabox_grava_capa_miniatura_e_baixa_o_episodio_de_verdade() {
+        let client = reqwest::Client::new();
+        let series = crate::dramabox::fetch_series(&client, "pt", "42000000639", "")
+            .await
+            .expect("lista a serie");
+        assert!(!series.covers.is_empty(), "essa serie tem capa");
+        assert!(series.trailer.is_none(), "o DramaBox nao publica trailer");
+
+        let dir = dir_de_teste("dramabox_e2e");
+
+        let poster = fetch_poster(&client, &series, &dir, "", &[])
+            .await
+            .expect("baixa a capa");
+        assert_eq!(poster, "poster.jpg");
+        assert!(dir.join("poster.jpg").is_file());
+
+        let ep1 = series
+            .episodes
+            .iter()
+            .find(|e| e.number == 1)
+            .expect("episodio 1 existe");
+        let thumb = fetch_thumb(&client, series.source, &ep1.thumb, &dir, 1, "", &[])
+            .await
+            .expect("baixa a miniatura do episodio 1");
+        assert_eq!(thumb, format!("{THUMBS_DIR}/E01.jpg"));
+        assert!(dir.join(&thumb).is_file());
+
+        // Sem trailer: a funcao precisa dizer "nao tem" em vez de falhar.
+        let control = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(crate::download::RUN));
+        let sem_trailer = ensure_trailer(
+            &client,
+            &series,
+            &dir,
+            &crate::reelshort::Session::default(),
+            "",
+            control.clone(),
+        )
+        .await
+        .expect("nao e erro nao ter trailer");
+        assert!(sem_trailer.is_none());
+
+        // O download de verdade, pelo caminho progressivo. `gear.size` vem 0
+        // (a origem nao declara tamanho): o downloader tem que se virar com o
+        // Content-Length da resposta.
+        let gear = ep1.gears.first().expect("episodio 1 liberado");
+        assert_eq!(gear.size, 0, "a listagem do DramaBox nao declara tamanho");
+        let dest = dir.join("ep01.mp4");
+        let outcome =
+            crate::download::download_episode(&client, gear, &dest, "", control, |_, _| {})
+                .await
+                .expect("baixa o episodio 1");
+        assert!(matches!(outcome, crate::download::Outcome::Done(_)));
+
+        // MP4 real, publicavel — o contrato entregue a quem exibe a biblioteca.
+        let info = crate::download::validate_video(&dest, true)
+            .await
+            .expect("o episodio baixado e um MP4 valido");
+        assert!(info.width > 0 && info.height > 0, "video sem dimensao");
+        assert!(
+            info.height > info.width,
+            "novela vertical: {}x{}",
+            info.width,
+            info.height
+        );
+
+        let mut m = read(&dir);
+        patch_series(&mut m, &series, Some(poster));
+        let entry = episode_entry(ep1, "ep01.mp4".into(), Some(thumb));
+        patch_episode(&mut m, 1, entry);
+        write(&dir, &m).expect("grava o manifesto");
+
+        let raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["source"], "dramabox");
+        assert_eq!(v["sourceUrl"], series.url());
+        assert_eq!(v["poster"], "poster.jpg");
+        // Sem trailer, o campo simplesmente nao existe — nunca `null`.
+        assert!(v.get("trailer").is_none() || v["trailer"].is_null());
+        assert_eq!(v["episodes"]["1"]["thumb"], format!("{THUMBS_DIR}/E01.jpg"));
+        assert_eq!(v["episodes"]["1"]["locked"], false);
+        // Duracao em segundos, nao nos milissegundos que a origem declara.
+        let dur = v["episodes"]["1"]["duration"].as_f64().unwrap();
+        assert!(dur > 30.0 && dur < 3600.0, "duracao fora de escala: {dur}");
+        // E a mesma duracao que o MP4 baixado mede: prova que a conversao de
+        // milissegundos para segundos foi feita, e na escala certa.
+        assert!(
+            (dur - info.duration).abs() < 5.0,
+            "duracao declarada {dur}s longe da medida {}s",
+            info.duration
+        );
+        // Temas crus, como a origem mandou.
+        assert!(v["themes"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

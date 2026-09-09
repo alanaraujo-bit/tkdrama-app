@@ -4,8 +4,11 @@
 //! permissao do app (ver capabilities/default.json, `windows: ["main"]`).
 //! Conteudo externo nunca enxerga as APIs nativas.
 
+mod awake;
 mod backfill;
+mod bulk;
 pub mod candyjar;
+pub mod dramabox;
 mod disk;
 pub mod manifest;
 pub mod media;
@@ -935,6 +938,25 @@ pub(crate) async fn load_series(app: &AppHandle, url: String) -> Res<media::Seri
         return Ok(series);
     }
 
+    // DramaBox: mesmo caso do CandyJar — a pagina e renderizada no servidor
+    // lendo os cookies da requisicao, entao a sessao ja capturada basta e nao
+    // ha cabecalho extra a farejar. Deslogado a origem responde como visitante
+    // (so o comeco liberado), o que e resposta valida e nao erro.
+    if let Some((lang, id)) = dramabox::parse_url(&url) {
+        refresh_cookie(app, media::Source::Dramabox).await;
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        let cookie = state.cookie_for(media::Source::Dramabox);
+        let series = dramabox::fetch_series(&state.client, &lang, &id, &cookie)
+            .await
+            .map_err(|e| e.to_string())?;
+        state
+            .series_cache
+            .lock()
+            .unwrap()
+            .insert(series.source.cache_key(&series.drama_id), series.clone());
+        return Ok(series);
+    }
+
     // URL direta da serie tem prioridade; senao, resolve a partir do video.
     let drama_id = match tiktok::parse_drama_id(&url) {
         Some(id) => id,
@@ -942,7 +964,7 @@ pub(crate) async fn load_series(app: &AppHandle, url: String) -> Res<media::Seri
             Some(vid) => resolve_drama_from_video(app, &vid).await?,
             None => {
                 return Err("Nao reconheci essa URL. Cole o link de uma novela ou de um \
-                            episodio do TikTok, do ReelShort ou do CandyJar."
+                            episodio do TikTok, do ReelShort, do CandyJar ou do DramaBox."
                     .to_string())
             }
         },
@@ -1176,6 +1198,64 @@ fn settings_set(app: AppHandle, state: State<'_, Arc<AppState>>, settings: Setti
     Ok(())
 }
 
+// ---------------------------------------------------------- o que ja tenho
+
+/// O que a pasta de uma novela ja tem, lido do disco.
+///
+/// A interface perguntava isso a fila ("tarefas com status concluido"), o que e
+/// memoria do app e nao verdade do disco: depois de *Limpar concluidos* o app
+/// esquecia tudo e voltava a oferecer o download de episodios que estao ali. O
+/// disco nunca esquece.
+///
+/// Conta so o que esta publicado e valido — um `.parcial` interrompido nao e
+/// episodio que se tem.
+#[tauri::command]
+fn series_on_disk(state: State<'_, Arc<AppState>>, name: String) -> serde_json::Value {
+    let dest = state.settings.lock().unwrap().dest_dir.clone();
+    let dir = media::series_dir(&dest, &name);
+    if !dir.is_dir() {
+        return serde_json::json!({ "dir": dir.to_string_lossy(), "exists": false, "have": [] });
+    }
+    let have: Vec<u32> = manifest::episode_files(&dir)
+        .into_iter()
+        .filter(|(_, nome)| download::published_mp4(&dir.join(nome)))
+        .map(|(n, _)| n)
+        .collect();
+    serde_json::json!({
+        "dir": dir.to_string_lossy(),
+        "exists": true,
+        "have": have,
+    })
+}
+
+// ------------------------------------------------------------ lote de links
+
+/// Le o texto colado e diz o que da para fazer com ele — sem gastar rede.
+///
+/// Existe separado do `bulk_add` porque a rodada leva minutos: o usuario
+/// precisa ver o que vai acontecer ANTES de mandar rodar, e nao descobrir no
+/// fim que metade da lista nao era link de novela.
+#[tauri::command]
+fn bulk_preview(state: State<'_, Arc<AppState>>, text: String) -> Vec<bulk::Candidate> {
+    bulk::preview(&state, &text)
+}
+
+/// Processa a lista inteira, no ritmo da plataforma. Devolve o relatorio final.
+#[tauri::command]
+async fn bulk_add(app: AppHandle, urls: Vec<String>, options: bulk::Options) -> bulk::Report {
+    bulk::run(&app, urls, options).await
+}
+
+#[tauri::command]
+fn bulk_cancel() {
+    bulk::cancel();
+}
+
+#[tauri::command]
+fn bulk_running() -> bool {
+    bulk::running()
+}
+
 #[tauri::command]
 fn disk_info(state: State<'_, Arc<AppState>>, path: Option<String>) -> serde_json::Value {
     let dir = path.unwrap_or_else(|| state.settings.lock().unwrap().dest_dir.clone());
@@ -1211,6 +1291,11 @@ pub fn run() {
             let handle = app.handle().clone();
             queue::load(&handle);
             queue::start_scheduler(handle.clone());
+            // Os dois lacos que sustentam uma fila deixada sozinha a noite
+            // inteira: a sonda reabre o portao quando a internet volta, e o
+            // zelador reapresenta a fila ao que falhou por motivo passageiro.
+            queue::start_connectivity_probe(handle.clone());
+            queue::start_janitor(handle.clone());
             watch::start(handle.clone());
 
             // Fechar a janela minimiza para a bandeja: o processo e a fila
@@ -1284,6 +1369,11 @@ pub fn run() {
             settings_set,
             disk_info,
             open_path,
+            series_on_disk,
+            bulk_preview,
+            bulk_add,
+            bulk_cancel,
+            bulk_running,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

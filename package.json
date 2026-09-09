@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "check:ids": "node scripts/check-ids.mjs",
+    "build": "node scripts/check-ids.mjs && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

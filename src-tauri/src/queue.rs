@@ -10,12 +10,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::awake;
 use crate::candyjar;
+use crate::dramabox;
 use crate::download::{self, Control, Outcome, CANCEL, PAUSE, RUN};
 use crate::manifest::{self, Manifest};
 use crate::media::{self, Series, Source};
@@ -91,6 +93,18 @@ pub struct Task {
     /// Unix seconds antes dos quais a tarefa nao deve ser reiniciada (backoff).
     #[serde(default)]
     pub retry_at: u64,
+    /// De que natureza foi a ultima falha. E por este campo, e nao pelo texto
+    /// da tela, que o zelador decide o que ressuscitar.
+    #[serde(default)]
+    pub fail_kind: FailKind,
+    /// Quantas vezes o zelador ja ressuscitou esta tarefa depois de ela ter
+    /// falhado de vez. Limitado por `MAX_REVIVALS`: sem teto, um episodio que
+    /// morreu por um motivo mal classificado giraria em falso a noite inteira.
+    ///
+    /// Persistido de proposito: o teto tem de sobreviver a um fechamento do
+    /// app, senao ele se reseta justo depois de uma queda — quando mais importa.
+    #[serde(default)]
+    pub revivals: u8,
     /// Segundos efetivamente gastos baixando (pausas nao entram na conta).
     #[serde(default)]
     pub elapsed_secs: u64,
@@ -206,6 +220,27 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub seq: AtomicU64,
     pub dirty: AtomicU8,
+    /// A rede caiu.
+    ///
+    /// Sem este portao, uma queda de vinte minutos as 3h nao para o agendador:
+    /// ele continua puxando tarefa nova, cada uma queima as suas seis
+    /// tentativas em ~223s e morre. Com cinquenta novelas na fila isso e um
+    /// muro de centenas de falhas permanentes esperando o usuario acordar —
+    /// que e exatamente o que ele pediu para nunca acontecer.
+    ///
+    /// Enquanto ligado, o agendador nao inicia nada e a sonda testa a rede de
+    /// tempos em tempos. Nao e persistido: ao abrir o app, presume-se conectado
+    /// e a primeira falha real reacende o sinal.
+    pub offline: AtomicBool,
+    /// Desde quando o portao esta fechado (unix secs).
+    ///
+    /// Serve ao teto de `MAX_OFFLINE`: um portao que so abre por sucesso de uma
+    /// sonda externa e um portao que pode emperrar fechado — basta a origem
+    /// recusar o HEAD da sonda, ou responder com um desafio, para a fila
+    /// congelar para sempre anunciando "sem conexao" com a internet perfeita.
+    /// Silencioso e autossustentado, e pior que o muro de erros que o portao
+    /// existe para evitar.
+    pub offline_since: AtomicU64,
 }
 
 impl AppState {
@@ -232,6 +267,8 @@ impl AppState {
             client,
             seq: AtomicU64::new(0),
             dirty: AtomicU8::new(1),
+            offline: AtomicBool::new(false),
+            offline_since: AtomicU64::new(0),
         }
     }
 
@@ -586,6 +623,7 @@ fn spawn_episode_manifest(state: &Arc<AppState>, id: &str) {
                     Source::Tiktok => "tiktok",
                     Source::Reelshort => "reelshort",
                     Source::Candyjar => "candyjar",
+                    Source::Dramabox => "dramabox",
                 }
                 .into();
             }
@@ -647,6 +685,7 @@ pub fn start_scheduler(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<Arc<AppState>>().inner().clone();
         let mut ticks: u64 = 0;
+        let mut estava_offline = false;
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
             ticks += 1;
@@ -655,7 +694,33 @@ pub fn start_scheduler(app: AppHandle) {
             // Mesmo no modo paralelo, tres fluxos e o teto deliberado.
             let settings = state.settings.lock().unwrap().clone();
             let limit = if settings.sequential { 1 } else { settings.concurrency.clamp(1, 3) };
-            while running_count(&state) < limit {
+            // Rede caida: nao inicia nada. O que ja estava rodando termina (ou
+            // falha e classifica), mas a fila para de alimentar o moedor. E
+            // este portao, e nao tentativa infinita por tarefa, que impede a
+            // cascata: duas mil tarefas imortais ainda passariam vinte minutos
+            // se debatendo.
+            // O portao e autolimitado: passado `MAX_OFFLINE` ele abre sozinho e
+            // deixa uma tarefa tentar de verdade. Se a rede ainda estiver fora,
+            // essa tarefa falha e fecha o portao de novo — custo de uma
+            // tentativa. Sem este teto, o portao dependeria SO do sucesso da
+            // sonda, e uma sonda recusada pela origem congelaria a fila para
+            // sempre com a internet funcionando.
+            if state.offline.load(Ordering::Relaxed) {
+                let desde = state.offline_since.load(Ordering::Relaxed);
+                if desde > 0 && now_secs().saturating_sub(desde) >= MAX_OFFLINE {
+                    state.offline.store(false, Ordering::Relaxed);
+                    state.offline_since.store(0, Ordering::Relaxed);
+                }
+            }
+            let bloqueado = state.offline.load(Ordering::Relaxed);
+            // A tela precisa saber. Sem isto, uma fila parada por queda de rede
+            // e indistinguivel de uma fila travada por defeito — e as 3h nao ha
+            // ninguem para diferenciar as duas.
+            if bloqueado != estava_offline {
+                estava_offline = bloqueado;
+                let _ = app.emit("queue://offline", bloqueado);
+            }
+            while !bloqueado && running_count(&state) < limit {
                 let Some(id) = pick_next(&state) else { break };
                 {
                     let mut tasks = state.tasks.lock().unwrap();
@@ -675,12 +740,94 @@ pub fn start_scheduler(app: AppHandle) {
             // Emite no maximo ~4x/s, e so quando algo mudou. Tarefas em backoff
             // contam como "vivas": a contagem regressiva precisa andar na tela.
             let alive = running_count(&state) > 0 || has_pending_retry(&state);
+
+            // Enquanto ha o que baixar, o Windows nao suspende. E o defeito que
+            // nenhuma retentativa alcanca: a cena real e "mando baixar e vou
+            // dormir", e se a maquina dorme junto nada baixa — o usuario acorda
+            // culpando o app por um trabalho que nunca chegou a rodar.
+            //
+            // Vale tambem para a espera da rede: uma queda as 3h nao pode virar
+            // uma maquina suspensa as 3h05, senao ela nunca ve a rede voltar.
+            let ha_trabalho = {
+                let tasks = state.tasks.lock().unwrap();
+                tasks
+                    .iter()
+                    .any(|t| matches!(t.status, Status::Running | Status::Queued))
+            };
+            awake::manter_acordado(ha_trabalho);
             if state.dirty.swap(0, Ordering::Relaxed) == 1 || alive {
                 let _ = app.emit("queue://update", state.snapshot());
             }
             // Salva de tempos em tempos para sobreviver a um fechamento abrupto.
             if ticks % 40 == 0 {
                 save(&app);
+            }
+        }
+    });
+}
+
+/// Ate quando o portao pode ficar fechado sem ninguem provar que a rede voltou.
+///
+/// Cinco minutos: longo o bastante para uma queda comum passar sem a fila se
+/// debater, curto o bastante para uma sonda enganada nao custar a noite.
+const MAX_OFFLINE: u64 = 300;
+
+/// A rede responde?
+///
+/// A pergunta e "da para alcancar a internet?", e nao "a origem esta simpatica
+/// hoje". Por isso a lista comeca por um host neutro: TikTok e ReelShort podem
+/// recusar um HEAD sem cookies, ou devolver um desafio, e tratar isso como
+/// "internet fora" manteria a fila parada com a rede perfeita.
+async fn rede_responde(state: &Arc<AppState>) -> bool {
+    for url in [
+        "https://cloudflare.com/cdn-cgi/trace",
+        "https://www.tiktok.com/",
+        "https://www.reelshort.com/",
+    ] {
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.client.head(url).header("User-Agent", media::UA).send(),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_some();
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Vigia da conexao.
+///
+/// So acorda de verdade quando o agendador ja se declarou offline; enquanto a
+/// rede esta boa, este laco custa um teste de booleano a cada 15s. Quando a
+/// rede volta, ele reabre o portao e devolve a fila ao trabalho — sem ninguem
+/// precisar estar acordado para clicar em nada.
+pub fn start_connectivity_probe(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            if !state.offline.load(Ordering::Relaxed) {
+                continue;
+            }
+            if rede_responde(&state).await {
+                state.offline.store(false, Ordering::Relaxed);
+                state.offline_since.store(0, Ordering::Relaxed);
+                // Quem estava esperando o backoff pode ir agora: a espera era
+                // pela rede, e ela voltou.
+                {
+                    let mut tasks = state.tasks.lock().unwrap();
+                    for t in tasks.iter_mut() {
+                        if t.status == Status::Queued && t.retry_at > 0 {
+                            t.retry_at = 0;
+                        }
+                    }
+                }
+                state.mark_dirty();
+                let _ = app.emit("queue://online", true);
             }
         }
     });
@@ -707,6 +854,9 @@ async fn refresh_urls(state: &Arc<AppState>, id: &str) -> anyhow::Result<()> {
     }
     if source == Source::Candyjar {
         return refresh_candyjar(state, id, &drama_id, episode, &lang).await;
+    }
+    if source == Source::Dramabox {
+        return refresh_dramabox(state, id, &drama_id, episode, &lang).await;
     }
     let cookie = state.cookie_for(Source::Tiktok);
     let series = tiktok::fetch_series(&state.client, &drama_id, &cookie).await?;
@@ -825,6 +975,44 @@ async fn refresh_candyjar(
     Ok(())
 }
 
+/// Reassina a URL de um episodio do DramaBox na hora de baixar.
+///
+/// Diferente do ReelShort e do CandyJar, aqui nao ha pagina de episodio: a
+/// listagem da serie ja traz o MP4 de todo episodio liberado, e reconsultar
+/// essa mesma pagina e o que devolve a URL com assinatura nova. `t.urls` guarda
+/// sempre uma entrada so — a origem publica um arquivo por episodio, sem
+/// variantes de qualidade e sem faixa de audio separada.
+async fn refresh_dramabox(
+    state: &Arc<AppState>,
+    id: &str,
+    series_id: &str,
+    episode: u32,
+    lang: &str,
+) -> anyhow::Result<()> {
+    let locked = {
+        let tasks = state.tasks.lock().unwrap();
+        tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.locked)
+            .unwrap_or(true)
+    };
+    let cookie = state.cookie_for(Source::Dramabox);
+    let url =
+        dramabox::resolve_media(&state.client, lang, series_id, episode, locked, &cookie).await?;
+
+    let mut tasks = state.tasks.lock().unwrap();
+    if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
+        t.urls = vec![url];
+        t.gear_name = dramabox::GEAR_NAME.to_string();
+        t.codec = "h264".into();
+        // O tamanho nao vem na listagem: quem baixa o descobre pelo
+        // `Content-Length` da propria resposta.
+        t.size = 0;
+    }
+    Ok(())
+}
+
 fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
     tauri::async_runtime::spawn(async move {
         // URLs assinadas expiram: renova antes de comecar se necessario.
@@ -847,12 +1035,12 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
                 // "Nao existe mais" e definitivo; qualquer outra coisa (rede,
                 // sessao, API fora do ar) merece nova tentativa automatica.
                 if msg.contains("nao existe mais") || msg.contains("sem midia acessivel") {
-                    finish(&state, &id, Status::Blocked, Some(friendly(&msg)));
+                    finish(&state, &id, Status::Blocked, Some(friendly(&msg)), FailKind::Terminal);
                 } else if is_auth_error(&msg) {
                     // Repetir nao resolve login: falha logo, com a instrucao certa.
-                    finish(&state, &id, Status::Failed, Some(friendly(&msg)));
-                } else if !schedule_retry(&state, &id, &friendly(&msg), true) {
-                    finish(&state, &id, Status::Failed, Some(friendly(&msg)));
+                    finish(&state, &id, Status::Failed, Some(friendly(&msg)), classify(&msg));
+                } else if !schedule_retry(&state, &id, &friendly(&msg), true, classify(&msg)) {
+                    finish(&state, &id, Status::Failed, Some(friendly(&msg)), classify(&msg));
                 }
                 return;
             }
@@ -887,7 +1075,7 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
         let local_hls = source == Source::Reelshort
             && download::nonempty(&download::hls_source_path(&dest));
         if gear.urls.is_empty() && !local_hls {
-            finish(&state, &id, Status::Blocked, Some("sem midia acessivel".into()));
+            finish(&state, &id, Status::Blocked, Some("sem midia acessivel".into()), FailKind::Terminal);
             return;
         }
 
@@ -948,7 +1136,11 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
                 )
                 .await
             }
-            Source::Tiktok => {
+            // As duas entregam MP4 progressivo numa URL assinada, entao seguem
+            // pelo mesmo caminho. No DramaBox `urls` tem sempre uma entrada so
+            // (um arquivo por episodio); no TikTok sao CDNs alternativos do
+            // mesmo arquivo. O laco de `download_episode` atende os dois.
+            Source::Tiktok | Source::Dramabox => {
                 download::download_episode(
                     &state.client,
                     &gear,
@@ -982,11 +1174,11 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
                         t.refreshes = 0;
                     }
                 }
-                finish(&state, &id, Status::Done, None);
+                finish(&state, &id, Status::Done, None, FailKind::None);
                 // O arquivo existe: agora ele pode entrar no manifesto.
                 spawn_episode_manifest(&state, &id);
             }
-            Ok(Outcome::Paused) => finish(&state, &id, Status::Paused, None),
+            Ok(Outcome::Paused) => finish(&state, &id, Status::Paused, None, FailKind::None),
             Ok(Outcome::Canceled) => {
                 // Cancelar remove a tarefa da lista; o .part fica para retomada futura.
                 state.tasks.lock().unwrap().retain(|t| t.id != id);
@@ -1023,15 +1215,23 @@ fn spawn_download(app: AppHandle, state: Arc<AppState>, id: String) {
                 let fatal_remux = msg.contains("FFmpeg")
                     || msg.contains("converter o episodio para MP4")
                     || msg.contains("MP4 vazio");
-                if fatal_remux || !schedule_retry(&state, &id, &reason, stale) {
-                    finish(&state, &id, Status::Failed, Some(reason));
+                if fatal_remux || !schedule_retry(&state, &id, &reason, stale, classify(&msg)) {
+                    finish(&state, &id, Status::Failed, Some(reason), classify(&msg));
                 }
             }
         }
     });
 }
 
-fn finish(state: &Arc<AppState>, id: &str, status: Status, error: Option<String>) {
+/// Encerra uma tarefa. `kind` classifica a falha para o zelador; sucesso e
+/// pausa passam `FailKind::None`.
+fn finish(
+    state: &Arc<AppState>,
+    id: &str,
+    status: Status,
+    error: Option<String>,
+    kind: FailKind,
+) {
     let mut tasks = state.tasks.lock().unwrap();
     if let Some(t) = tasks.iter_mut().find(|t| t.id == id) {
         if let Some(start) = t.active_since.take() {
@@ -1041,6 +1241,7 @@ fn finish(state: &Arc<AppState>, id: &str, status: Status, error: Option<String>
         t.error = error;
         t.speed = 0.0;
         t.retry_at = 0;
+        t.fail_kind = kind;
         t.finished_at = Some(now_secs());
     }
     drop(tasks);
@@ -1051,6 +1252,73 @@ fn finish(state: &Arc<AppState>, id: &str, status: Status, error: Option<String>
 /// a unica coisa que resolve, que e o usuario entrar no TikTok de novo.
 fn is_auth_error(msg: &str) -> bool {
     tiktok::is_auth_error(msg)
+}
+
+/// De que natureza foi a falha.
+///
+/// Existe para o zelador (`start_janitor`) decidir o que ressuscitar sem ler a
+/// frase em portugues que a tela mostra. Amarrar politica a texto de interface
+/// e o jeito de uma correcao de copy quebrar a recuperacao em silencio, meses
+/// depois, de madrugada — que e exatamente quando ninguem esta olhando.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FailKind {
+    #[default]
+    None,
+    /// A internet caiu, a conexao travou, a transferencia veio incompleta.
+    /// Passa sozinho: e o caso que o zelador existe para atender.
+    Network,
+    /// O link assinado venceu. Recupera-se reconsultando a serie.
+    Stale,
+    /// Acabou o espaco. Passa quando o usuario libera disco — nao antes.
+    Disk,
+    /// Sessao morta. So o usuario resolve, entrando de novo.
+    Auth,
+    /// Episodio pago, fora do ar, sem midia, FFmpeg quebrado. Repetir nao muda
+    /// o resultado; ressuscitar isso seria girar em falso para sempre.
+    Terminal,
+}
+
+impl FailKind {
+    /// Vale a pena tentar de novo mais tarde, sozinho?
+    fn recoverable(self) -> bool {
+        matches!(self, FailKind::Network | FailKind::Stale | FailKind::Disk)
+    }
+}
+
+/// Classifica a falha pela mensagem CRUA, antes de qualquer traducao.
+pub fn classify(msg: &str) -> FailKind {
+    let m = msg.to_lowercase();
+    if is_auth_error(msg) {
+        FailKind::Auth
+    } else if m.contains("espaco")
+        || m.contains("espaço")
+        || m.contains("os error 112")
+        || m.contains("no space")
+    {
+        FailKind::Disk
+    } else if m.contains("nao existe mais")
+        || m.contains("não existe mais")
+        || m.contains("sem midia acessivel")
+        || m.contains("pago no")
+        || m.contains("indisponível no")
+        || m.contains("ffmpeg")
+        || m.contains("mp4 vazio")
+        || m.contains("404")
+    {
+        FailKind::Terminal
+    } else if m.contains("403")
+        || m.contains("401")
+        || m.contains("tamanho inesperado")
+    {
+        FailKind::Stale
+    } else {
+        // O resto — DNS, connect, timeout, transferencia incompleta, e tambem o
+        // que ainda nao foi catalogado — conta como rede. Errar para o lado de
+        // "tenta de novo" custa uma tentativa; errar para o lado de "desiste"
+        // custa o episodio.
+        FailKind::Network
+    }
 }
 
 /// Traduz o erro cru (dump de HTTP, erro do reqwest) para uma frase curta que
@@ -1075,6 +1343,14 @@ fn friendly(msg: &str) -> String {
         "acabou o espaco em disco"
     } else if m.contains("nao existe mais") {
         "o episodio saiu do ar"
+    // Paywall das fontes que declaram o bloqueio por sessao (ReelShort,
+    // CandyJar, DramaBox). Sem estas duas linhas o texto do bloqueio caia no
+    // "falha de rede" do fim, que manda o usuario procurar problema na
+    // conexao quando o que falta e direito sobre o episodio.
+    } else if m.contains("pago no") {
+        "episodio pago — precisa ser liberado na sua conta"
+    } else if m.contains("indisponível no") {
+        "a origem nao publica esse episodio"
     } else if m.contains("sem midia acessivel") {
         "precisa ser desbloqueado no TikTok"
     } else if m.contains("ffmpeg nao foi encontrado") {
@@ -1096,7 +1372,101 @@ fn friendly(msg: &str) -> String {
 /// Devolve `false` quando as tentativas acabaram — ai sim a tarefa falha de
 /// vez. E isto que permite deixar a fila baixando durante a noite: uma queda
 /// de rede vira uma espera, nao uma fila morta esperando um clique.
-fn schedule_retry(state: &Arc<AppState>, id: &str, reason: &str, renew_urls: bool) -> bool {
+/// Quantas vezes o zelador ressuscita uma tarefa que ja falhou de vez.
+///
+/// Seis tentativas rapidas (`MAX_ATTEMPTS`) cobrem um soluco; estas cobrem uma
+/// noite. Com o ciclo de 10 minutos, dao cerca de duas horas de recuperacao por
+/// tarefa antes de o app admitir que aquele episodio nao vai vir.
+const MAX_REVIVALS: u8 = 12;
+
+/// De quanto em quanto tempo o zelador passa.
+const JANITOR_CYCLE: Duration = Duration::from_secs(600);
+
+/// Devolve a fila o que falhou por motivo passageiro. Devolve quantas voltaram.
+///
+/// Separado do laco para poder ser testado sem esperar dez minutos.
+fn revive_recuperaveis(state: &Arc<AppState>) -> usize {
+    let mut revividas = 0usize;
+    let mut tasks = state.tasks.lock().unwrap();
+    for t in tasks.iter_mut() {
+        if t.status != Status::Failed || !t.fail_kind.recoverable() || t.revivals >= MAX_REVIVALS {
+            continue;
+        }
+        t.revivals += 1;
+        t.attempts = 0;
+        t.status = Status::Queued;
+        t.retry_at = 0;
+        t.finished_at = None;
+        t.speed = 0.0;
+        // O link assinado que venceu tem de ser reconsultado; sem limpar as
+        // URLs a tarefa tentaria de novo o mesmo endereco morto e falharia
+        // identica, gastando uma ressurreicao a toa.
+        if t.fail_kind == FailKind::Stale {
+            t.refreshes = t.refreshes.saturating_add(1);
+            t.urls.clear();
+        }
+        t.error = Some(format!(
+            "voltando a tentar sozinho ({}/{})",
+            t.revivals, MAX_REVIVALS
+        ));
+        revividas += 1;
+    }
+    revividas
+}
+
+/// Ressuscita o que falhou por motivo que passa sozinho.
+///
+/// O `schedule_retry` cobre o soluco de segundos; este cobre a noite. Uma queda
+/// de rede as 3h esgota as seis tentativas de cada tarefa em menos de quatro
+/// minutos e as manda para `Failed` — recuperaveis so pelo botao "Tentar de
+/// novo", que ninguem vai apertar dormindo. O zelador aperta esse botao
+/// sozinho, de dez em dez minutos, e so no que faz sentido reapertar.
+pub fn start_janitor(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        loop {
+            tokio::time::sleep(JANITOR_CYCLE).await;
+            // Offline recente: nao adianta ressuscitar para falhar de novo. A
+            // sonda reabre o portao, e a passagem seguinte faz o trabalho.
+            //
+            // Mas a espera tem limite. O portao ja se abre sozinho depois de
+            // `MAX_OFFLINE`; amarrar o zelador a ele sem teto proprio faria as
+            // duas travas se sustentarem uma na outra — e o ciclo de dez
+            // minutos e mais longo que os cinco do portao, entao aqui basta
+            // nao esperar mais que uma passagem.
+            let desde = state.offline_since.load(Ordering::Relaxed);
+            let preso_ha_pouco = desde > 0 && now_secs().saturating_sub(desde) < MAX_OFFLINE;
+            if state.offline.load(Ordering::Relaxed) && preso_ha_pouco {
+                continue;
+            }
+            let revividas = revive_recuperaveis(&state);
+            if revividas > 0 {
+                state.mark_dirty();
+                save(&app);
+                let _ = app.emit("queue://revived", revividas);
+            }
+        }
+    });
+}
+
+/// `reason` e o texto que vai para a tela; `kind` e a classificacao vinda da
+/// mensagem crua. Os dois andam juntos e nunca se derivam um do outro: politica
+/// lida de copy quebra em silencio na primeira revisao de texto.
+fn schedule_retry(
+    state: &Arc<AppState>,
+    id: &str,
+    reason: &str,
+    renew_urls: bool,
+    kind: FailKind,
+) -> bool {
+    // Falha de rede acende o portao, mesmo quando esta tarefa ja esgotou as
+    // tentativas dela: e daqui que o agendador aprende que a internet caiu,
+    // sem precisar de um monitor separado.
+    if kind == FailKind::Network && !state.offline.swap(true, Ordering::Relaxed) {
+        // Só na borda: uma falha atrás da outra não pode empurrar o relógio
+        // para a frente, ou o teto de `MAX_OFFLINE` nunca venceria.
+        state.offline_since.store(now_secs(), Ordering::Relaxed);
+    }
     let mut tasks = state.tasks.lock().unwrap();
     let Some(t) = tasks.iter_mut().find(|t| t.id == id) else {
         return false;
@@ -1105,6 +1475,7 @@ fn schedule_retry(state: &Arc<AppState>, id: &str, reason: &str, renew_urls: boo
     if matches!(t.status, Status::Paused | Status::Done) {
         return true;
     }
+    t.fail_kind = kind;
     if t.attempts + 1 >= MAX_ATTEMPTS {
         return false;
     }
@@ -1159,6 +1530,15 @@ pub fn enqueue(
     let ext = series.extension();
     let mut added = 0;
 
+    // O que a pasta ja tem, numa varredura so, ANTES do laco.
+    //
+    // Antes a pergunta "ja tenho?" era feita so no caminho exato que o
+    // downloader escreveria hoje. Um arquivo renomeado, ou vindo de quando o
+    // nome da novela era outro, nao era encontrado — e o episodio baixava de
+    // novo por cima do que ja estava la. Procurar pelo NUMERO, que e a
+    // identidade estavel, e o que faz o "nunca duas vezes" valer de verdade.
+    let no_disco = manifest::episode_files(&dir);
+
     let mut tasks = state.tasks.lock().unwrap();
     for num in episodes {
         let id = task_id(series.source, &series.drama_id, *num);
@@ -1175,8 +1555,25 @@ pub fn enqueue(
         let size = gear.as_ref().map(|g| g.size).unwrap_or(0);
 
         // No ReelShort o tamanho so se conhece baixando, entao "ja tenho" nao
-        // pode ser por tamanho: vale o arquivo final existir com conteudo.
-        let have_file = download::published_mp4(&dest);
+        // pode ser por tamanho: vale existir um MP4 publicado e valido.
+        //
+        // O caminho de hoje primeiro; se nao houver, o arquivo que a pasta
+        // guarda com este numero. A validacao continua a mesma e continua
+        // estrita — muda so ONDE se procura, nunca o que conta como pronto.
+        let achado = no_disco
+            .get(num)
+            .map(|nome| dir.join(nome))
+            .filter(|p| *p != dest);
+        let existente = if download::published_mp4(&dest) {
+            Some(dest.clone())
+        } else {
+            achado.filter(|p| download::published_mp4(p))
+        };
+        let have_file = existente.is_some();
+        // O progresso e o tamanho saem do arquivo que existe de verdade, e nao
+        // do nome que o downloader usaria: senao a linha diria "0 B" sobre um
+        // episodio que esta inteiro no disco com outro nome.
+        let dest_real = existente.unwrap_or_else(|| dest.clone());
 
         let (status, error) = if !ep.available() {
             // Episodio pago entra na lista para o usuario ver que existe, mas
@@ -1198,7 +1595,7 @@ pub fn enqueue(
         // mentir sobre bytes que ja estao no disco.
         let mut size = size;
         let downloaded = if status == Status::Done {
-            let actual = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(size);
+            let actual = std::fs::metadata(&dest_real).map(|m| m.len()).unwrap_or(size);
             // Fonte sem tamanho anunciado: o arquivo no disco e a verdade.
             if size == 0 {
                 size = actual;
@@ -1221,7 +1618,10 @@ pub fn enqueue(
             locked: ep.locked,
             series: series.name.clone(),
             episode: *num,
-            dest: dest.to_string_lossy().to_string(),
+            // Para o que ainda vai baixar, `dest_real` e o proprio `dest`; para
+            // o que ja esta pronto sob outro nome, e o arquivo de verdade — que
+            // e o que "Abrir pasta" precisa encontrar.
+            dest: dest_real.to_string_lossy().to_string(),
             gear_name: gear.as_ref().map(|g| g.gear_name.clone()).unwrap_or_default(),
             codec: gear
                 .as_ref()
@@ -1249,6 +1649,8 @@ pub fn enqueue(
             urls: gear.map(|g| g.urls.clone()).unwrap_or_default(),
             speed: 0.0,
             attempts: 0,
+            fail_kind: FailKind::None,
+            revivals: 0,
             retry_at: 0,
             elapsed_secs: 0,
             created_at: now_secs(),
@@ -1365,6 +1767,12 @@ pub fn retry_failed(state: &Arc<AppState>) {
             t.refreshes = 0;
             t.retry_at = 0;
             t.finished_at = None;
+            // "Tentar de novo" e uma ordem do usuario, e ela devolve tambem o
+            // orcamento do zelador: sem isto, uma tarefa que gastou as doze
+            // ressurreicoes durante a noite ficaria fora do trabalho automatico
+            // para sempre, mesmo depois de o usuario ter consertado a causa.
+            t.revivals = 0;
+            t.fail_kind = FailKind::None;
         }
     }
     drop(tasks);
@@ -1413,6 +1821,8 @@ mod tests {
             urls: vec![],
             speed: 0.0,
             attempts: 0,
+            fail_kind: FailKind::None,
+            revivals: 0,
             retry_at: 0,
             elapsed_secs: 0,
             created_at: 0,
@@ -1566,7 +1976,7 @@ mod tests {
         // As primeiras falhas viram espera, nao morte da tarefa.
         for esperada in 1..MAX_ATTEMPTS {
             assert!(
-                schedule_retry(&state, "a", "sem conexao com a internet", false),
+                schedule_retry(&state, "a", "sem conexao com a internet", false, FailKind::Network),
                 "tentativa {esperada} deveria reagendar"
             );
             let tasks = state.tasks.lock().unwrap();
@@ -1577,7 +1987,153 @@ mod tests {
             assert!(t.error.as_deref().unwrap().contains("tentando de novo"));
         }
         // Esgotado o orcamento, a proxima falha e definitiva.
-        assert!(!schedule_retry(&state, "a", "sem conexao com a internet", false));
+        assert!(!schedule_retry(&state, "a", "sem conexao com a internet", false, FailKind::Network));
+    }
+
+    /// A classificacao sai da mensagem CRUA, e separa o que passa sozinho do
+    /// que so o usuario resolve. E ela que decide o que o zelador ressuscita.
+    #[test]
+    fn classifica_a_falha_pela_mensagem_crua() {
+        // Passam sozinhas.
+        assert_eq!(classify("error sending request for url"), FailKind::Network);
+        assert_eq!(classify("dns error"), FailKind::Network);
+        assert_eq!(classify("a transferencia veio incompleta"), FailKind::Network);
+        assert_eq!(classify("HTTP 403"), FailKind::Stale);
+        assert_eq!(classify("tamanho inesperado"), FailKind::Stale);
+        assert_eq!(classify("os error 112"), FailKind::Disk);
+
+        // Nao passam sozinhas.
+        assert_eq!(classify("HTTP 404"), FailKind::Terminal);
+        assert_eq!(classify("episodio pago no ReelShort"), FailKind::Terminal);
+        assert_eq!(classify("sem midia acessivel"), FailKind::Terminal);
+        assert_eq!(classify("o FFmpeg falhou"), FailKind::Terminal);
+
+        assert!(FailKind::Network.recoverable());
+        assert!(FailKind::Stale.recoverable());
+        assert!(FailKind::Disk.recoverable());
+        assert!(!FailKind::Terminal.recoverable());
+        assert!(!FailKind::Auth.recoverable());
+        assert!(!FailKind::None.recoverable());
+    }
+
+    /// Uma queda de rede fecha o portao do agendador.
+    ///
+    /// Sem isto, a fila continua puxando tarefa nova durante a queda e cada uma
+    /// queima as seis tentativas dela em menos de quatro minutos — o muro de
+    /// falhas permanentes que aparece de manha.
+    #[test]
+    fn falha_de_rede_fecha_o_portao_do_agendador() {
+        let state = Arc::new(AppState::new());
+        state
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task("a", Status::Running, PRIO_NORMAL, 1));
+
+        assert!(!state.offline.load(Ordering::Relaxed));
+        schedule_retry(&state, "a", "sem conexao", false, FailKind::Network);
+        assert!(state.offline.load(Ordering::Relaxed), "a rede caiu: o portao fecha");
+        assert!(state.offline_since.load(Ordering::Relaxed) > 0, "marca a hora");
+    }
+
+    /// Falhas seguidas nao empurram o relogio: o teto de `MAX_OFFLINE` precisa
+    /// vencer. Sem isto o portao so abriria por sucesso da sonda — e uma sonda
+    /// recusada pela origem congelaria a fila com a internet funcionando.
+    #[test]
+    fn falhas_seguidas_nao_adiam_o_teto_do_portao() {
+        let state = Arc::new(AppState::new());
+        state
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task("a", Status::Running, PRIO_NORMAL, 1));
+
+        schedule_retry(&state, "a", "sem conexao", false, FailKind::Network);
+        let primeira = state.offline_since.load(Ordering::Relaxed);
+        // Finge que o portao fechou ha muito tempo.
+        state.offline_since.store(primeira - 250, Ordering::Relaxed);
+
+        schedule_retry(&state, "a", "sem conexao", false, FailKind::Network);
+        assert_eq!(
+            state.offline_since.load(Ordering::Relaxed),
+            primeira - 250,
+            "so a borda marca a hora; a segunda falha nao reinicia a contagem"
+        );
+    }
+
+    /// Falha que nao e de rede nao fecha o portao: um episodio pago nao pode
+    /// parar a fila inteira.
+    #[test]
+    fn falha_terminal_nao_fecha_o_portao() {
+        let state = Arc::new(AppState::new());
+        state
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task("a", Status::Running, PRIO_NORMAL, 1));
+
+        schedule_retry(&state, "a", "episodio pago", false, FailKind::Terminal);
+        assert!(!state.offline.load(Ordering::Relaxed));
+    }
+
+    /// O agendador nao escolhe ninguem enquanto o portao esta fechado.
+    #[test]
+    fn com_o_portao_fechado_nada_e_escolhido_pelo_agendador() {
+        let state = Arc::new(AppState::new());
+        state
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task("a", Status::Queued, PRIO_NORMAL, 1));
+
+        // `pick_next` continua achando a tarefa: quem decide nao puxar e o
+        // agendador, lendo o portao. Este teste tranca o contrato dos dois.
+        assert_eq!(pick_next(&state).as_deref(), Some("a"));
+        state.offline.store(true, Ordering::Relaxed);
+        assert!(state.offline.load(Ordering::Relaxed));
+    }
+
+    /// O zelador so ressuscita o que passa sozinho, e respeita o teto.
+    #[test]
+    fn o_zelador_ressuscita_so_o_recuperavel_e_ate_o_teto() {
+        let state = Arc::new(AppState::new());
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            for (id, kind) in [
+                ("rede", FailKind::Network),
+                ("vencido", FailKind::Stale),
+                ("pago", FailKind::Terminal),
+                ("sessao", FailKind::Auth),
+            ] {
+                let mut t = task(id, Status::Failed, PRIO_NORMAL, 1);
+                t.fail_kind = kind;
+                t.attempts = MAX_ATTEMPTS;
+                tasks.push(t);
+            }
+            // Ja gastou o orcamento de ressurreicoes.
+            let mut t = task("cansada", Status::Failed, PRIO_NORMAL, 5);
+            t.fail_kind = FailKind::Network;
+            t.revivals = MAX_REVIVALS;
+            tasks.push(t);
+        }
+
+        revive_recuperaveis(&state);
+
+        let tasks = state.tasks.lock().unwrap();
+        let estado = |id: &str| tasks.iter().find(|t| t.id == id).unwrap().status;
+        assert_eq!(estado("rede"), Status::Queued, "rede volta sozinha");
+        assert_eq!(estado("vencido"), Status::Queued, "link vencido reconsulta");
+        assert_eq!(estado("pago"), Status::Failed, "pago nao ressuscita");
+        assert_eq!(estado("sessao"), Status::Failed, "so o usuario resolve login");
+        assert_eq!(estado("cansada"), Status::Failed, "o teto e respeitado");
+
+        let revivida = tasks.iter().find(|t| t.id == "rede").unwrap();
+        assert_eq!(revivida.attempts, 0, "o orcamento de tentativas volta");
+        assert_eq!(revivida.revivals, 1);
+
+        // Link vencido tem de reconsultar: manter a URL morta repetiria a falha.
+        let vencida = tasks.iter().find(|t| t.id == "vencido").unwrap();
+        assert!(vencida.urls.is_empty());
     }
 
     #[test]

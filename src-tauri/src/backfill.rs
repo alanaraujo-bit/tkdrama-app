@@ -92,6 +92,7 @@ fn source_from_tag(tag: &str) -> Option<Source> {
         "tiktok" => Some(Source::Tiktok),
         "reelshort" => Some(Source::Reelshort),
         "candyjar" => Some(Source::Candyjar),
+        "dramabox" => Some(Source::Dramabox),
         _ => None,
     }
 }
@@ -148,10 +149,12 @@ pub fn identify(
         drama_id: f.drama_id.clone(),
         // A URL guardada na serie acompanhada e a fonte do idioma; ela vence a
         // reconstrucao, e por isso o chamador prefere `f.url`. So ReelShort e
-        // CandyJar usam idioma; cada um tem seu proprio formato de URL.
+        // CandyJar e DramaBox usam idioma; cada um tem seu proprio formato de
+        // URL.
         lang: match f.source {
             Source::Reelshort => crate::reelshort::parse_url(&f.url).map(|(lang, _)| lang),
             Source::Candyjar => crate::candyjar::parse_url(&f.url).map(|(lang, _)| lang),
+            Source::Dramabox => crate::dramabox::parse_url(&f.url).map(|(lang, _)| lang),
             Source::Tiktok => None,
         }
         .unwrap_or_default(),
@@ -326,6 +329,8 @@ mod tests {
             speed: 0.0,
             attempts: 0,
             retry_at: 0,
+            fail_kind: crate::queue::FailKind::None,
+            revivals: 0,
             elapsed_secs: 0,
             created_at: 0,
             finished_at: None,
@@ -492,6 +497,38 @@ mod tests {
         let (lang, id) = crate::candyjar::parse_url(&cj.url()).unwrap();
         assert_eq!(lang, "en");
         assert_eq!(id, "725");
+
+        // DramaBox: idem, "en" e o default do site.
+        let db = Identity {
+            source: Source::Dramabox,
+            drama_id: "42000000639".into(),
+            lang: String::new(),
+            stored_url: String::new(),
+        };
+        let (lang, id) = crate::dramabox::parse_url(&db.url()).unwrap();
+        assert_eq!(lang, "en");
+        assert_eq!(id, "42000000639");
+    }
+
+    #[test]
+    fn manifesto_preserva_o_idioma_da_url_do_dramabox() {
+        let dir = dir_de_teste("manifesto_dramabox_pt");
+        let m = manifest::Manifest {
+            drama_id: "42000000639".into(),
+            source: "dramabox".into(),
+            // A URL do player, com slug e episodio, e a que o usuario cola —
+            // o manifesto pode ter guardado ela.
+            source_url:
+                "https://www.dramabox.com/pt/video/42000000639_Novela/700040712_Episode-1".into(),
+            ..Default::default()
+        };
+        manifest::write(&dir, &m).unwrap();
+
+        let id = identify(&dir, &[], &[]).unwrap();
+        let (lang, book) = crate::dramabox::parse_url(&id.url()).unwrap();
+        assert_eq!(lang, "pt");
+        assert_eq!(book, "42000000639");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
