@@ -1252,6 +1252,78 @@ fn chave_de_nome(s: &str) -> String {
         .collect()
 }
 
+/// Esta pasta e desta novela?
+///
+/// Igualdade, ou uma comecar com a outra. Nunca "contem em qualquer posicao":
+/// um titulo curto como "Ela" esta dentro de "A Novela do Ex", e a vitrine
+/// esconderia uma novela que o usuario nao tem, dizendo que ele ja tem — falha
+/// silenciosa, que ninguem vai investigar.
+///
+/// Prefixo cobre o caso real que motivou a tolerancia: a pasta ganhar um sufixo
+/// ("Nome da Novela Dublado") ou o titulo vir com um a mais que o nome no disco.
+/// E ainda assim so a partir de 6 caracteres, porque prefixo curto volta a ser
+/// palpite.
+fn mesma_novela(titulo: &str, pasta: &str) -> bool {
+    if titulo.is_empty() || pasta.is_empty() {
+        return false;
+    }
+    if titulo == pasta {
+        return true;
+    }
+    let menor = titulo.len().min(pasta.len());
+    menor >= 6 && (titulo.starts_with(pasta) || pasta.starts_with(titulo))
+}
+
+/// Quantos episodios esta pasta tem, para efeito de EXIBICAO.
+///
+/// Conta arquivo de video com numero, sem validar cada um: `episode_files` ja
+/// descarta `.part`/`.parcial`/`.tmp`, que e o que separa "baixando" de
+/// "baixado". Validar de verdade custa ler 4 MB e checar o `moov` por arquivo —
+/// aceitavel para UMA novela, proibitivo para a vitrine inteira, que sao 121
+/// pastas e milhares de arquivos numa tela que precisa responder rapido.
+///
+/// A precisao que importa mora onde a decisao e tomada: `queue::enqueue` valida
+/// estritamente antes de pular um episodio, entao um arquivo corrompido volta
+/// para a fila mesmo tendo sido contado aqui.
+fn episodios_na_pasta(dir: &std::path::Path) -> usize {
+    manifest::episode_files(dir).len()
+}
+
+/// Reconta, no disco, quantos episodios cada titulo ja tem. Sem rede.
+///
+/// A vitrine envelhece assim que a fila entrega alguma coisa: uma novela que
+/// aparecia como "nao tenho" as 22h esta baixada as 3h, e a tela continuaria
+/// oferecendo o download dela. Buscar a vitrine de novo resolveria, mas gastaria
+/// uma requisicao para responder uma pergunta que o disco responde sozinho.
+#[tauri::command]
+fn discover_have(state: State<'_, Arc<AppState>>, names: Vec<String>) -> Vec<usize> {
+    let dest = state.settings.lock().unwrap().dest_dir.clone();
+    let pastas = pastas_da_biblioteca(&dest);
+    names
+        .iter()
+        .map(|n| {
+            let chave = chave_de_nome(n);
+            pastas
+                .iter()
+                .find(|(nome, _)| mesma_novela(&chave, nome))
+                .map(|(_, dir)| episodios_na_pasta(dir))
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// As pastas da biblioteca, ja com a chave de comparacao. Uma leitura so:
+/// perguntar por novela faria 121 varreduras para a mesma resposta.
+fn pastas_da_biblioteca(dest: &str) -> Vec<(String, std::path::PathBuf)> {
+    std::fs::read_dir(dest)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| (chave_de_nome(&e.file_name().to_string_lossy()), e.path()))
+        .collect()
+}
+
 /// O que a vitrine do ReelShort mostra hoje, marcado com o que voce ja tem.
 ///
 /// Uma requisicao para a lista inteira: nada e consultado por novela aqui. A
@@ -1281,31 +1353,14 @@ async fn discover_reelshort(app: AppHandle) -> Res<Vec<serde_json::Value>> {
         (dest, seguidas)
     };
 
-    // As pastas existentes, uma leitura so. Perguntar por novela faria 121
-    // varreduras de diretorio para responder a mesma coisa.
-    let pastas: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(&dest)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .map(|e| (chave_de_nome(&e.file_name().to_string_lossy()), e.path()))
-        .collect();
+    let pastas = pastas_da_biblioteca(&dest);
 
     let mut out = Vec::with_capacity(vitrine.len());
     for l in vitrine {
         let chave = chave_de_nome(&l.title);
-        let pasta = pastas
-            .iter()
-            .find(|(nome, _)| *nome == chave || nome.contains(&chave) || chave.contains(nome));
-        // Quantos episodios ja existem de verdade — nao "a pasta existe".
-        let tenho = pasta
-            .map(|(_, dir)| {
-                manifest::episode_files(dir)
-                    .into_iter()
-                    .filter(|(_, nome)| download::published_mp4(&dir.join(nome)))
-                    .count()
-            })
-            .unwrap_or(0);
+        let pasta = pastas.iter().find(|(nome, _)| mesma_novela(&chave, nome));
+        // Quantos episodios ja existem — nao "a pasta existe".
+        let tenho = pasta.map(|(_, dir)| episodios_na_pasta(dir)).unwrap_or(0);
         let seguindo = seguidas
             .iter()
             .any(|k| *k == media::Source::Reelshort.cache_key(&l.book_id));
@@ -1468,6 +1523,7 @@ pub fn run() {
             open_path,
             series_on_disk,
             discover_reelshort,
+            discover_have,
             bulk_preview,
             bulk_add,
             bulk_cancel,
@@ -1475,4 +1531,39 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// O pareamento pasta/titulo nunca pode casar por acaso.
+    ///
+    /// Um falso positivo aqui esconde da vitrine uma novela que o usuario NAO
+    /// tem, dizendo que ele ja tem. E silencioso: nao ha erro, nao ha log, e a
+    /// novela simplesmente nunca aparece para ser marcada.
+    #[test]
+    fn so_casa_pasta_com_novela_quando_da_para_afirmar() {
+        let k = chave_de_nome;
+
+        // O mesmo nome, com a pontuacao e o acento que o disco perde.
+        assert!(mesma_novela(
+            &k("Peão Descartado, O Incomparável Rei Dragão"),
+            &k("Peão Descartado,O Incomparável Rei Dragão")
+        ));
+        // Sufixo na pasta: o caso real que justifica tolerar prefixo.
+        assert!(mesma_novela(&k("A Sem-Pelo"), &k("A Sem-Pelo Dublado")));
+
+        // O perigo: titulo curto que aparece no MEIO do nome da pasta.
+        assert!(
+            !mesma_novela(&k("Ela"), &k("A Novela do Ex")),
+            "titulo curto no meio do nome nao e a mesma novela"
+        );
+        assert!(!mesma_novela(&k("Amor"), &k("O Grande Amor Perdido")));
+        // Prefixo curto continua sendo palpite.
+        assert!(!mesma_novela(&k("Rei"), &k("Rei Dragao")));
+        // Novelas diferentes que comecam igual nao se confundem.
+        assert!(!mesma_novela(&k("A Sem-Pelo"), &k("Beijada por garras")));
+        assert!(!mesma_novela("", &k("Qualquer")));
+    }
 }

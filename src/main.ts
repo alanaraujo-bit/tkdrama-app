@@ -1055,6 +1055,34 @@ async function refreshDiscover() {
   }
 }
 
+/**
+ * Reconta no disco o que a vitrine já tem, sem tocar na rede.
+ *
+ * A vitrine envelhece assim que a fila entrega algo: uma novela que aparecia
+ * como "não tenho" às 22h está baixada às 3h, e a tela continuaria oferecendo
+ * o download dela. Buscar a vitrine de novo resolveria, mas gastaria uma
+ * requisição para uma pergunta que o disco responde sozinho.
+ */
+async function refreshDiscoverHave() {
+  if (!vitrine.length) return;
+  try {
+    const contagens = await invoke<number[]>("discover_have", {
+      names: vitrine.map((d) => d.name),
+    });
+    if (contagens.length !== vitrine.length) return;
+    vitrine = vitrine.map((d, i) => ({ ...d, have_episodes: contagens[i] }));
+    // O que passou a existir no disco sai da seleção: marcá-lo continuaria
+    // prometendo um download que o backend vai (corretamente) recusar.
+    for (const d of vitrine) {
+      if (jaTenho(d)) vitrinePicked.delete(d.url);
+    }
+    renderDiscover();
+  } catch {
+    // Sem a releitura a tela apenas fica com o número da última busca. O
+    // `enqueue` continua conferindo a pasta, então nada baixa duas vezes.
+  }
+}
+
 function renderDiscover() {
   const grid = $("#discover-grid");
   const visiveis = visiveisNaVitrine();
@@ -1634,7 +1662,12 @@ function wire() {
   // Navegação entre visões.
   $("#tab-queue").addEventListener("click", () => showView("queue"));
   $("#tab-watch").addEventListener("click", () => showView("watch"));
-  $("#tab-discover").addEventListener("click", () => showView("discover"));
+  // Ao voltar para a aba, o disco pode ter mudado desde a última busca — é o
+  // caso normal depois de uma noite baixando. Releitura local, sem rede.
+  $("#tab-discover").addEventListener("click", () => {
+    showView("discover");
+    refreshDiscoverHave();
+  });
 
   // Vitrine. Nada é buscado ao abrir a aba: a consulta é uma ação explícita,
   // porque ela divide a sessão com a fila que pode estar correndo.
@@ -2046,10 +2079,21 @@ async function main() {
   // o usuário buscar a novela de novo — a mesma amnésia que o disco resolveu
   // do outro lado.
   let concluidosDaSerie = -1;
+  // Mesma ideia para a vitrine: com a aba aberta durante a fila, os números de
+  // "na pasta" envelheceriam à vista do usuário.
+  let concluidosNaFila = -1;
   await listen<Task[]>("queue://update", (e) => {
     lastEvent = Date.now();
     tasks = e.payload;
     renderQueue();
+
+    if (!$("#view-discover").hidden && vitrine.length) {
+      const prontos = tasks.filter((t) => t.status === "done").length;
+      if (prontos !== concluidosNaFila) {
+        concluidosNaFila = prontos;
+        refreshDiscoverHave();
+      }
+    }
 
     if (!series || $("#series-modal").hidden) return;
     const prontos = tasks.filter(
