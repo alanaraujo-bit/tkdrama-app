@@ -42,6 +42,7 @@ const atributos = [
   ["[data-watch-filter]", /data-watch-filter=/],
   ["[data-settings-tab]", /data-settings-tab=/],
   ["[data-settings-pane]", /data-settings-pane=/],
+  ["[data-discover-filter]", /data-discover-filter=/],
 ];
 
 const faltando = [...procurados].filter(([id]) => !declarados.has(id));

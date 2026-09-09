@@ -999,6 +999,171 @@ async function runBulk() {
   }
 }
 
+// ----------------------------------------------------------------- vitrine
+
+/** Uma novela vista na vitrine. Espelha o payload de `discover_reelshort`. */
+interface Discovered {
+  book_id: string;
+  name: string;
+  cover: string;
+  description: string;
+  episodes: number;
+  /** A partir de qual episódio é pago. 0 = nada anunciado. */
+  paid_start: number;
+  url: string;
+  /** Quantos episódios desta novela já estão na pasta. */
+  have_episodes: number;
+  following: boolean;
+}
+
+let vitrine: Discovered[] = [];
+let vitrinePicked = new Set<string>();
+let discoverFilter: "new" | "all" = "new";
+let discoverQuery = "";
+
+/** Já está na pasta? Um único episódio conta: a novela não é desconhecida. */
+function jaTenho(d: Discovered): boolean {
+  return d.have_episodes > 0;
+}
+
+function visiveisNaVitrine(): Discovered[] {
+  return vitrine.filter((d) => {
+    if (discoverQuery && !d.name.toLowerCase().includes(discoverQuery)) return false;
+    return discoverFilter === "all" || !jaTenho(d);
+  });
+}
+
+async function refreshDiscover() {
+  const btn = $<HTMLButtonElement>("#discover-refresh");
+  const status = $("#discover-status");
+  btn.disabled = true;
+  btn.textContent = "Buscando...";
+  status.textContent = "";
+  try {
+    vitrine = await invoke<Discovered[]>("discover_reelshort");
+    vitrinePicked = new Set();
+    const novas = vitrine.filter((d) => !jaTenho(d)).length;
+    // O texto diz de onde vem e o que não é. Sem isso "105 novelas" se lê como
+    // "tudo o que falta no ReelShort", e não é: é a vitrine de hoje.
+    status.textContent = `vitrine de hoje · ${vitrine.length} novelas · ${novas} que você não tem`;
+    renderDiscover();
+  } catch (e) {
+    banner(String(e), "is-error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Buscar vitrine";
+  }
+}
+
+function renderDiscover() {
+  const grid = $("#discover-grid");
+  const visiveis = visiveisNaVitrine();
+
+  // Três vazios diferentes, e a diferença importa: nunca buscou (instrução),
+  // filtrou até sobrar nada (afrouxe o filtro) e já tenho tudo (boa notícia).
+  // Um texto só mentiria em dois dos três casos.
+  const vazio = $("#discover-empty");
+  vazio.hidden = visiveis.length > 0;
+  if (vitrine.length === 0) {
+    vazio.querySelector<HTMLElement>(".empty-title")!.textContent =
+      "Veja o que existe que você ainda não tem";
+    // Restaura a instrução: os outros ramos a substituem, e sem isto o estado
+    // inicial voltaria com o texto de um filtro vazio.
+    vazio.querySelector<HTMLElement>(".empty-hint")!.innerHTML =
+      "<strong>Buscar vitrine</strong> lê de uma vez a página inicial do ReelShort e " +
+      "mostra as novelas de lá, já descontando as que estão na sua pasta.";
+  } else if (discoverFilter === "new" && !discoverQuery) {
+    vazio.querySelector<HTMLElement>(".empty-title")!.textContent =
+      "Você já tem todas as novelas da vitrine de hoje";
+    vazio.querySelector<HTMLElement>(".empty-hint")!.textContent =
+      `As ${vitrine.length} em destaque hoje já estão na sua pasta. Amanhã a vitrine muda.`;
+  } else {
+    vazio.querySelector<HTMLElement>(".empty-title")!.textContent =
+      "Nenhuma novela com esse filtro";
+    vazio.querySelector<HTMLElement>(".empty-hint")!.textContent =
+      `${vitrine.length} na vitrine — mude o filtro ou limpe a busca.`;
+  }
+  $("#discover-foot").hidden = vitrine.length === 0;
+  $("#tab-discover-count").textContent = vitrine.length
+    ? String(vitrine.filter((d) => !jaTenho(d)).length)
+    : "";
+  $("#discover-count").textContent = vitrine.length
+    ? `${visiveis.length} de ${vitrine.length}`
+    : "";
+
+  grid.textContent = "";
+  for (const d of visiveis) {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "disc" + (vitrinePicked.has(d.url) ? " is-sel" : "");
+    card.setAttribute("role", "listitem");
+    card.dataset.url = d.url;
+    card.setAttribute("aria-pressed", String(vitrinePicked.has(d.url)));
+
+    const capa = document.createElement("img");
+    capa.className = "disc-cover";
+    capa.alt = "";
+    capa.loading = "lazy";
+    if (d.cover) capa.src = d.cover;
+    else capa.hidden = true;
+
+    const nome = document.createElement("span");
+    nome.className = "disc-name";
+    nome.textContent = d.name;
+
+    const sub = document.createElement("span");
+    sub.className = "disc-sub";
+    const partes: string[] = [];
+    if (d.episodes) partes.push(`${d.episodes} ep`);
+    // O que já tenho vem antes do resto: é o que decide se marco ou não.
+    if (d.have_episodes) partes.push(`${d.have_episodes} na pasta`);
+    if (d.following) partes.push("acompanhando");
+    // O que a PLATAFORMA declara, não o que a sua conta libera: a vitrine não
+    // consulta conta nenhuma, e quem tem VIP abre muito além disto. Dizer
+    // "9 livres" aqui seria afirmar sobre um direito que esta tela não checou.
+    if (d.paid_start > 0 && d.episodes >= d.paid_start) {
+      partes.push(`pago do E${String(d.paid_start).padStart(2, "0")}`);
+    }
+    sub.textContent = partes.join(" · ");
+
+    card.title = d.description || d.name;
+    card.append(capa, nome, sub);
+    if (jaTenho(d)) card.classList.add("is-have");
+    grid.append(card);
+  }
+
+  const n = vitrinePicked.size;
+  // O tamanho é estimativa honesta: o ReelShort não anuncia bytes, e ~380 MB
+  // por novela é a média medida na própria biblioteca.
+  $("#discover-picked").textContent = n
+    ? `${n} selecionada${n > 1 ? "s" : ""} · cerca de ${(n * 0.38).toFixed(1)} GB · ` +
+      `${duration(Math.max(0, n - 1) * BULK_PACE_SECS)} só de consulta`
+    : "";
+  $<HTMLButtonElement>("#discover-add").disabled = n === 0;
+  $<HTMLButtonElement>("#discover-add").textContent = n
+    ? `Adicionar ${n} novela${n > 1 ? "s" : ""}`
+    : "Adicionar selecionadas";
+}
+
+/**
+ * Manda as marcadas para o mesmo caminho do lote.
+ *
+ * Reusa `bulk_add` inteiro em vez de um caminho próprio: é o mesmo trabalho —
+ * resolver a novela, enfileirar o que falta, acompanhar — e um segundo caminho
+ * seria uma segunda chance de divergir no ritmo e no piso de disco.
+ */
+async function addFromDiscover() {
+  const urls = [...vitrinePicked];
+  if (!urls.length) return;
+  $("#bulk-modal").hidden = false;
+  $<HTMLTextAreaElement>("#bulk-input").value = urls.join("\n");
+  await previewBulk();
+  banner(
+    `${urls.length} novela(s) da vitrine prontas no lote. Confira e clique em Adicionar.`,
+    "is-ok",
+  );
+}
+
 // -------------------------------------------------------------- metadados
 
 interface MetaReport {
@@ -1409,10 +1574,11 @@ async function refreshDisk() {
  * o mapa cheio de nós órfãos e a fila voltaria a congelar — o defeito mais
  * caro que este app já teve.
  */
-function showView(which: "queue" | "watch") {
-  const abas: Array<["queue" | "watch", string, string]> = [
+function showView(which: "queue" | "watch" | "discover") {
+  const abas: Array<["queue" | "watch" | "discover", string, string]> = [
     ["queue", "#tab-queue", "#view-queue"],
     ["watch", "#tab-watch", "#view-watch"],
+    ["discover", "#tab-discover", "#view-discover"],
   ];
   for (const [nome, tabSel, viewSel] of abas) {
     const ativa = nome === which;
@@ -1468,6 +1634,43 @@ function wire() {
   // Navegação entre visões.
   $("#tab-queue").addEventListener("click", () => showView("queue"));
   $("#tab-watch").addEventListener("click", () => showView("watch"));
+  $("#tab-discover").addEventListener("click", () => showView("discover"));
+
+  // Vitrine. Nada é buscado ao abrir a aba: a consulta é uma ação explícita,
+  // porque ela divide a sessão com a fila que pode estar correndo.
+  $("#discover-refresh").addEventListener("click", refreshDiscover);
+  $("#discover-search").addEventListener("input", (e) => {
+    discoverQuery = (e.target as HTMLInputElement).value.trim().toLowerCase();
+    renderDiscover();
+  });
+  for (const btn of document.querySelectorAll<HTMLElement>("[data-discover-filter]")) {
+    btn.addEventListener("click", () => {
+      discoverFilter = btn.dataset.discoverFilter as "new" | "all";
+      for (const outro of document.querySelectorAll<HTMLElement>("[data-discover-filter]")) {
+        outro.classList.toggle("is-active", outro === btn);
+      }
+      renderDiscover();
+    });
+  }
+  // "Marcar todas" marca o que está VISÍVEL, não a vitrine inteira: marcar 105
+  // com um filtro aplicado surpreenderia — e aqui cada marca é ~380 MB.
+  $("#discover-all").addEventListener("click", () => {
+    for (const d of visiveisNaVitrine()) vitrinePicked.add(d.url);
+    renderDiscover();
+  });
+  $("#discover-none").addEventListener("click", () => {
+    vitrinePicked = new Set();
+    renderDiscover();
+  });
+  $("#discover-grid").addEventListener("click", (e) => {
+    const card = (e.target as HTMLElement).closest<HTMLElement>(".disc");
+    if (!card) return;
+    const url = card.dataset.url!;
+    if (vitrinePicked.has(url)) vitrinePicked.delete(url);
+    else vitrinePicked.add(url);
+    renderDiscover();
+  });
+  $("#discover-add").addEventListener("click", addFromDiscover);
 
   // Contas.
   $("#accounts-chip").addEventListener("click", () => {

@@ -1228,6 +1228,103 @@ fn series_on_disk(state: State<'_, Arc<AppState>>, name: String) -> serde_json::
     })
 }
 
+// ----------------------------------------------------------------- vitrine
+
+/// Normaliza um nome para comparar pasta com titulo.
+///
+/// A pasta e escrita por `media::safe_name`, que ja troca caractere proibido
+/// por espaco; e o titulo pode divergir em acento, pontuacao ou caixa sem ser
+/// outra novela. Comparar so o que sobra de letra e digito evita oferecer de
+/// novo o que ja esta no disco por causa de uma virgula.
+fn chave_de_nome(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' => Some('a'),
+            'é' | 'è' | 'ê' | 'ë' => Some('e'),
+            'í' | 'ì' | 'î' | 'ï' => Some('i'),
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' => Some('o'),
+            'ú' | 'ù' | 'û' | 'ü' => Some('u'),
+            'ç' => Some('c'),
+            c if c.is_alphanumeric() => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// O que a vitrine do ReelShort mostra hoje, marcado com o que voce ja tem.
+///
+/// Uma requisicao para a lista inteira: nada e consultado por novela aqui. A
+/// pergunta desta tela e "o que existe que eu nao tenho?", e ela se responde
+/// sem tocar em nenhuma pagina de serie.
+///
+/// **Nao decide nada.** Devolve uma proposta; quem escolhe continua sendo o
+/// usuario, marcando o que quer. E o limite do PRODUCT.md de pe: o app nunca
+/// enche a pasta com novela que ninguem escolheu.
+#[tauri::command]
+async fn discover_reelshort(app: AppHandle) -> Res<Vec<serde_json::Value>> {
+    refresh_cookie(&app, media::Source::Reelshort).await;
+    harvest_reelshort_auth(&app).await;
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let sess = state.rs_session();
+
+    let vitrine = reelshort::browse(&state.client, "pt", &sess)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (dest, seguidas) = {
+        let dest = state.settings.lock().unwrap().dest_dir.clone();
+        let seguidas: Vec<String> = watch::list(&state)
+            .iter()
+            .map(|f| f.key())
+            .collect();
+        (dest, seguidas)
+    };
+
+    // As pastas existentes, uma leitura so. Perguntar por novela faria 121
+    // varreduras de diretorio para responder a mesma coisa.
+    let pastas: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(&dest)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| (chave_de_nome(&e.file_name().to_string_lossy()), e.path()))
+        .collect();
+
+    let mut out = Vec::with_capacity(vitrine.len());
+    for l in vitrine {
+        let chave = chave_de_nome(&l.title);
+        let pasta = pastas
+            .iter()
+            .find(|(nome, _)| *nome == chave || nome.contains(&chave) || chave.contains(nome));
+        // Quantos episodios ja existem de verdade — nao "a pasta existe".
+        let tenho = pasta
+            .map(|(_, dir)| {
+                manifest::episode_files(dir)
+                    .into_iter()
+                    .filter(|(_, nome)| download::published_mp4(&dir.join(nome)))
+                    .count()
+            })
+            .unwrap_or(0);
+        let seguindo = seguidas
+            .iter()
+            .any(|k| *k == media::Source::Reelshort.cache_key(&l.book_id));
+
+        out.push(serde_json::json!({
+            "book_id": l.book_id,
+            "name": l.title,
+            "cover": l.cover,
+            "description": l.description,
+            "episodes": l.episodes,
+            "paid_start": l.paid_start,
+            "url": l.url("pt"),
+            "have_episodes": tenho,
+            "following": seguindo,
+        }));
+    }
+    Ok(out)
+}
+
 // ------------------------------------------------------------ lote de links
 
 /// Le o texto colado e diz o que da para fazer com ele — sem gastar rede.
@@ -1370,6 +1467,7 @@ pub fn run() {
             disk_info,
             open_path,
             series_on_disk,
+            discover_reelshort,
             bulk_preview,
             bulk_add,
             bulk_cancel,

@@ -537,11 +537,170 @@ fn best_variant(text: &str, base: &str) -> Option<String> {
     best.map(|(_, u)| u)
 }
 
+// ------------------------------------------------------------------- vitrine
+
+/// Uma novela vista na vitrine do site, antes de qualquer consulta a serie.
+///
+/// So o que a propria pagina inicial ja entrega. Nao ha requisicao por novela
+/// aqui: sao 121 titulos por UMA pagina, e consultar cada um custaria 121
+/// requisicoes para responder uma pergunta que e so "o que existe?".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listing {
+    pub book_id: String,
+    pub title: String,
+    /// Capa. Assinada e temporaria, como todas as imagens destas plataformas:
+    /// serve para a previa na tela, nunca para gravar.
+    pub cover: String,
+    pub description: String,
+    pub episodes: u32,
+    /// A partir de qual episodio o conteudo e pago. `0` = nada anunciado.
+    pub paid_start: u32,
+}
+
+impl Listing {
+    /// URL canonica da novela.
+    ///
+    /// Sem o slug de proposito: o site responde 301 para a forma com slug, o
+    /// cliente segue o redirecionamento, e `parse_url` reconhece as duas. Um
+    /// slug adivinhado seria uma chance a mais de errar sem ganho nenhum.
+    pub fn url(&self, lang: &str) -> String {
+        series_url(lang, &self.book_id)
+    }
+}
+
+/// Le a vitrine da pagina inicial.
+///
+/// Existe porque a pergunta "que novela eu ainda nao tenho?" so se respondia
+/// saindo do app, abrindo a plataforma e voltando com um link por vez. Aqui ela
+/// se responde com uma requisicao.
+///
+/// **Isto e uma vitrine, nao um catalogo.** E o que o site resolveu mostrar
+/// hoje — em alta, curado, rotativo. Rodar amanha traz um conjunto diferente, e
+/// nada aqui promete cobrir o acervo. Quem for exibir o resultado precisa dizer
+/// isso, senao "105 novelas" se le como "tudo o que falta", que e mentira.
+pub async fn browse(client: &reqwest::Client, lang: &str, sess: &Session) -> Result<Vec<Listing>> {
+    let data = get_page(client, &format!("{BASE}/{lang}"), sess).await?;
+    let mut achados: Vec<Listing> = Vec::new();
+    let mut vistos: Vec<String> = Vec::new();
+    collect_listings(&data, &mut achados, &mut vistos);
+    if achados.is_empty() {
+        bail!("a pagina inicial do ReelShort nao trouxe nenhuma novela");
+    }
+    Ok(achados)
+}
+
+/// Varre o JSON embutido atras de qualquer objeto que descreva uma novela.
+///
+/// Por varredura recursiva, e nao por caminho fixo: a pagina inicial e montada
+/// por blocos (destaque, em alta, por tema) e o formato deles muda sem aviso.
+/// Um caminho como `props.pageProps.blocks[2].list` quebraria na primeira
+/// reorganizacao do site — em silencio, devolvendo lista vazia. Procurar pela
+/// FORMA do objeto sobrevive a isso.
+fn collect_listings(v: &Value, out: &mut Vec<Listing>, vistos: &mut Vec<String>) {
+    match v {
+        Value::Array(itens) => {
+            for item in itens {
+                collect_listings(item, out, vistos);
+            }
+        }
+        Value::Object(map) => {
+            let id = map.get("book_id").and_then(|v| v.as_str()).unwrap_or("");
+            let title = map.get("book_title").and_then(|v| v.as_str()).unwrap_or("");
+            // A forma que identifica uma novela: id de 24 hex mais titulo.
+            let e_novela = id.len() == 24
+                && id.chars().all(|c| c.is_ascii_hexdigit())
+                && !title.is_empty();
+            if e_novela && !vistos.iter().any(|v| v == id) {
+                vistos.push(id.to_string());
+                out.push(Listing {
+                    book_id: id.to_string(),
+                    title: title.to_string(),
+                    cover: map
+                        .get("book_pic")
+                        .or_else(|| map.get("default_pic"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    description: map
+                        .get("special_desc")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    episodes: as_u64(map.get("chapter_count")) as u32,
+                    paid_start: as_u64(map.get("paid_start")) as u32,
+                });
+            }
+            // Desce mesmo depois de achar: um bloco pode aninhar outros.
+            for filho in map.values() {
+                collect_listings(filho, out, vistos);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const BOOK: &str = "69d8612ad6461266e80b7a17";
+
+    /// A vitrine acha novela em qualquer profundidade e nao repete.
+    ///
+    /// O formato imita o da pagina real: blocos aninhados, a mesma novela
+    /// aparecendo em mais de um bloco (destaque e "em alta"), e objetos vizinhos
+    /// que NAO sao novela e nao podem entrar.
+    #[test]
+    fn a_vitrine_acha_novela_aninhada_e_nao_repete() {
+        let dados = serde_json::json!({
+            "props": { "pageProps": {
+                "banner": { "book_id": BOOK, "book_title": "Primeira",
+                            "book_pic": "https://x/1.jpg", "chapter_count": 51,
+                            "paid_start": 10, "special_desc": "sinopse" },
+                "blocos": [
+                    { "titulo": "Em alta", "list": [
+                        // Repetida: ja apareceu no banner.
+                        { "book_id": BOOK, "book_title": "Primeira" },
+                        { "book_id": "6a71bd5eebaa88ea35049cb2", "book_title": "Segunda",
+                          "default_pic": "https://x/2.jpg", "chapter_count": 40 }
+                    ]},
+                    // Nao e novela: sem id valido.
+                    { "id": "banner-promo", "book_title": "Nao sou novela" },
+                    // Nao e novela: id no formato certo, mas sem titulo.
+                    { "book_id": "6a71bd5eebaa88ea35049cb3", "book_title": "" }
+                ]
+            }}
+        });
+
+        let mut achados = Vec::new();
+        collect_listings(&dados, &mut achados, &mut Vec::new());
+
+        assert_eq!(achados.len(), 2, "duas novelas distintas, sem repetir");
+        assert_eq!(achados[0].title, "Primeira");
+        assert_eq!(achados[0].episodes, 51);
+        assert_eq!(achados[0].paid_start, 10);
+        assert_eq!(achados[0].cover, "https://x/1.jpg");
+        // `default_pic` cobre quem nao traz `book_pic`.
+        assert_eq!(achados[1].cover, "https://x/2.jpg");
+    }
+
+    /// A URL sai sem slug: o site redireciona, e adivinhar o slug so criaria
+    /// uma chance de errar. E ela precisa voltar por `parse_url`.
+    #[test]
+    fn a_url_da_vitrine_volta_pelo_reconhecedor() {
+        let l = Listing {
+            book_id: BOOK.into(),
+            title: "X".into(),
+            cover: String::new(),
+            description: String::new(),
+            episodes: 0,
+            paid_start: 0,
+        };
+        let url = l.url("pt");
+        let (lang, id) = parse_url(&url).expect("a propria URL tem de ser reconhecida");
+        assert_eq!(lang, "pt");
+        assert_eq!(id, BOOK);
+    }
 
     /// Item de `online_base` como a API devolveu para "Como domar um coroa" em
     /// 07/09/2026. E o trailer: `serial_number` 0 e `chapter_type` 2.

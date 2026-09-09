@@ -14,6 +14,13 @@ como trabalho manual, episódio por episódio.
 - **Descobre a série inteira a partir de um link.** Cola-se a URL da novela (ou
   a de um episódio) e o app pagina a API até o último episódio, com a numeração
   correta.
+- **Mostra o que existe que você ainda não tem.** A aba *Descobrir* lê de uma
+  vez a página inicial do ReelShort — a mesma técnica do resto do app, o JSON
+  embutido na página — e exibe as novelas de lá em grade de capas, já marcando
+  quais estão na sua pasta. Você seleciona o que quiser e cai no fluxo do lote.
+  **É uma vitrine, não o acervo, e não um agendador:** são as que a plataforma
+  destaca hoje, amanhã são outras, e o app continua sem escolher novela sozinho
+  — ele propõe, quem marca é você.
 - **Adiciona muitas novelas de uma colagem só.** *Adicionar em lote* aceita
   texto solto — uma coluna de links, um bloco de conversa, HTML copiado de uma
   página — acha os links no meio, deduplica por novela e processa a lista
@@ -174,7 +181,7 @@ src-tauri/src/
   bulk.rs       muitas novelas de uma colagem só: extrai, deduplica, processa
   awake.rs      impede a máquina de suspender enquanto a fila tem trabalho
   tiktok.rs     cliente da API de short dramas do TikTok
-  reelshort.rs  cliente do ReelShort (HLS)
+  reelshort.rs  cliente do ReelShort (HLS) e a vitrine da página inicial
   candyjar.rs   cliente do CandyJar (HLS, fMP4/CMAF)
   dramabox.rs   cliente do DramaBox (MP4 progressivo assinado)
   media.rs      tipos comuns e escolha de qualidade

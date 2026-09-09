@@ -54,6 +54,17 @@
           Acompanhando
           <span id="tab-watch-count" class="tab-count"></span>
         </button>
+        <button
+          id="tab-discover"
+          class="tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="view-discover"
+        >
+          Descobrir
+          <span id="tab-discover-count" class="tab-count"></span>
+        </button>
       </nav>
 
       <div class="topbar-right">
@@ -176,6 +187,71 @@
         </div>
 
         <div id="watch-list" class="watch-list" role="list"></div>
+      </section>
+
+      <!--
+        Descobrir: uma vitrine, não um catálogo, e não um agendador.
+
+        O app continua sem escolher novela sozinho — ele PROPÕE, e quem marca é
+        o usuário. É o limite do PRODUCT.md de pé: uma rodada automática sobre
+        "as mais em alta" encheria o disco de série que ninguém escolheu.
+
+        O que aparece aqui é o que o ReelShort mostra na home hoje: curado e
+        rotativo. Amanhã é outro conjunto, e o cabeçalho diz isso — senão
+        "105 novelas" se lê como "tudo o que falta", que é mentira.
+      -->
+      <section id="view-discover" class="view" role="tabpanel" aria-labelledby="tab-discover" hidden>
+        <div class="view-head">
+          <h2>Descobrir</h2>
+          <div class="view-tools">
+            <span id="discover-status" class="muted"></span>
+            <button id="discover-refresh" class="btn btn-sm" type="button">Buscar vitrine</button>
+          </div>
+        </div>
+
+        <div class="watch-bar">
+          <div class="field field-sm">
+            <svg class="field-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14ZM21 21l-5-5"/></svg>
+            <input
+              id="discover-search"
+              type="search"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="Filtrar por nome"
+              aria-label="Filtrar a vitrine"
+            />
+          </div>
+          <div class="segmented" role="group" aria-label="Filtrar a vitrine">
+            <button class="seg is-active" data-discover-filter="new" type="button">Que não tenho</button>
+            <button class="seg" data-discover-filter="all" type="button">Todas</button>
+          </div>
+          <button id="discover-all" class="link-btn" type="button">Marcar todas</button>
+          <button id="discover-none" class="link-btn" type="button">Nenhuma</button>
+          <span class="spacer"></span>
+          <span id="discover-count" class="muted num"></span>
+        </div>
+
+        <div id="discover-empty" class="empty">
+          <p class="empty-title">Veja o que existe que você ainda não tem</p>
+          <p class="empty-hint">
+            <strong>Buscar vitrine</strong> lê de uma vez a página inicial do ReelShort e
+            mostra as novelas de lá, já descontando as que estão na sua pasta.
+          </p>
+          <p class="empty-hint">
+            É uma vitrine, não o acervo: são as que a plataforma destaca hoje, e amanhã
+            serão outras. O app não baixa nada sozinho — você marca o que quer.
+          </p>
+        </div>
+
+        <div id="discover-grid" class="discover-grid" role="list"></div>
+
+        <div id="discover-foot" class="discover-foot" hidden>
+          <span id="discover-picked" class="muted"></span>
+          <span class="spacer"></span>
+          <button id="discover-add" class="btn btn-primary" type="button" disabled>
+            Adicionar selecionadas
+          </button>
+        </div>
       </section>
     </main>
 

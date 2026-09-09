@@ -73,11 +73,22 @@ Ele abre o app e os episódios que saíram desde ontem já estão baixados.
   sozinho: a rodada automática usa o mesmo caminho de direito, e episódio fora
   do alcance da conta entra na lista como bloqueado, nunca como download.
 - Sem player embutido: o objetivo é ter o arquivo, assistido onde o usuário quiser.
-- Sem catálogo/busca de novelas dentro do app: a descoberta de novela **nova**
-  acontece na plataforma, e o app recebe o link. O automático reabastece o que
-  já foi apontado uma vez — ele nunca escolhe novela por conta própria. Colar
-  trinta links de uma vez não fere esse limite: continua sendo o usuário
-  apontando, só que em lote em vez de um a um.
+- **O app nunca escolhe novela sozinho.** Este é o limite, e ele é sobre
+  *decisão*, não sobre *informação*: o app pode mostrar o que existe, mas nada
+  entra na pasta sem o usuário ter marcado. Colar trinta links de uma vez não
+  fere isso — continua sendo ele apontando, em lote em vez de um a um. A aba
+  *Descobrir* também não: ela lê a vitrine da plataforma e propõe uma lista com
+  caixinhas; quem marca é o usuário.
+
+  O que caiu foi o "sem catálogo dentro do app". Ele existia por tabela — era
+  a forma mais fácil de garantir a regra de cima — mas custava caro: para saber
+  se uma novela já estava baixada, era preciso sair do app, abrir a plataforma
+  e voltar com um link. Mostrar a vitrine devolve essa resposta sem entregar a
+  decisão.
+
+  A vitrine é **curada e rotativa**, não o acervo: é o que a plataforma destaca
+  hoje. A interface precisa dizer isso, senão "105 novelas" se lê como "tudo o
+  que falta" — que seria mentira.
 - A pasta só contém novela que o usuário apontou. É por isso que o automático
   serve a lista de acompanhadas, e não um ranking: um agendador sobre "as mais
   em alta" encheria o disco de série que ninguém escolheu assistir.

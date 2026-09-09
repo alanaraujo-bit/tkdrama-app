@@ -1368,3 +1368,111 @@ svg {
   max-height: none;
   overflow: visible;
 }
+
+/* ---------------------------------------------------------------- vitrine */
+
+/* Grade de capas. A capa e o que se reconhece primeiro numa novela — mais que
+   o titulo, que aqui costuma ser longo e parecido com o da vizinha. */
+.discover-grid {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(126px, 1fr));
+  gap: 11px;
+  padding: 12px 13px;
+  align-content: start;
+}
+
+.disc {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 0 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.13s, background 0.13s;
+}
+
+.disc:hover {
+  border-color: var(--surface-3);
+  background: var(--surface-3);
+}
+
+/* Selecionada: borda de destaque MAIS a marca de canto. Uma novela escolhida
+   por engano custa ~380 MB, entao o estado nao pode depender so de cor. */
+.disc.is-sel {
+  border-color: var(--accent);
+  background: rgba(240, 168, 48, 0.09);
+}
+
+.disc.is-sel::after {
+  content: "✓";
+  position: absolute;
+  top: 5px;
+  right: 7px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #1a1204;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 17px;
+  text-align: center;
+}
+
+.disc {
+  position: relative;
+}
+
+/* Ja na pasta continua visivel, e apagada: escondendo, a contagem da vitrine
+   nao bateria com o que se ve. */
+.disc.is-have .disc-cover {
+  opacity: 0.4;
+}
+
+.disc.is-have .disc-name {
+  color: var(--text-dim);
+}
+
+.disc-cover {
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  background: var(--surface-3);
+  display: block;
+}
+
+.disc-name {
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.disc-sub {
+  padding: 0 8px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
+.discover-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 13px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
