@@ -408,7 +408,7 @@ async fn process_one(app: &AppHandle, url: &str, opts: &Options) -> Outcome {
         let episodios: Vec<u32> = series
             .episodes
             .iter()
-            .filter(|e| e.available() && !ja.contains(&e.number))
+            .filter(|e| media::episode_available(series.source, e) && !ja.contains(&e.number))
             .map(|e| e.number)
             .collect();
         outcome.already = series

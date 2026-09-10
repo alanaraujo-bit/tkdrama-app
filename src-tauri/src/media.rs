@@ -157,9 +157,22 @@ pub struct Episode {
 
 impl Episode {
     /// Da para baixar? Trancado nunca, mesmo que a midia esteja alcancavel.
+    /// Regra padrao — quem aplica excecao por fonte e `episode_available`.
     pub fn available(&self) -> bool {
         !self.locked && !self.gears.is_empty()
     }
+}
+
+/// Da para baixar? A unica politica de disponibilidade, compartilhada pela fila,
+/// o lote em massa e a interface: por regra vale `Episode::available()`
+/// (trancado ou sem midia fica de fora), com uma excecao. O episodio
+/// "isLocked" do CandyJar tem midia completa via um segundo `episodeStream` —
+/// paywall quebrado no nucleo (`candyjar.rs`) — entao ali o cadeado nao impede.
+pub fn episode_available(source: Source, ep: &Episode) -> bool {
+    if ep.gears.is_empty() {
+        return false; // sem midia nenhuma fonte salva
+    }
+    source == Source::Candyjar || !ep.locked
 }
 
 /// Um tema declarado pela origem, cru — `key` estavel, `value` como veio.
@@ -381,6 +394,30 @@ mod tests {
         // Mesmo com midia alcancavel, o cadeado manda.
         e.locked = true;
         assert!(!e.available());
+    }
+
+    #[test]
+    fn candyjar_trancado_ainda_e_disponivel() {
+        let mut e = ep(vec![gear("a", "h264", 100)]);
+        e.locked = true;
+        // Paywall quebrado no nucleo: a midia veio do segundo episodeStream.
+        assert!(episode_available(Source::Candyjar, &e));
+    }
+
+    #[test]
+    fn politica_de_fonte_mantem_regra_padrao() {
+        let mut e = ep(vec![gear("a", "h264", 100)]);
+        assert!(episode_available(Source::Tiktok, &e));
+        // Nas demais fontes o cadeado continua mandando.
+        for s in [Source::Tiktok, Source::Reelshort, Source::Dramabox] {
+            e.locked = true;
+            assert!(!episode_available(s, &e));
+        }
+        // Sem midia nao ha politica que salve: vale para qualquer fonte.
+        let sem_midia = ep(Vec::new());
+        for s in SOURCES {
+            assert!(!episode_available(s, &sem_midia));
+        }
     }
 
     #[test]

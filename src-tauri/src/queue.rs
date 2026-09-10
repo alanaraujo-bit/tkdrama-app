@@ -1575,9 +1575,10 @@ pub fn enqueue(
         // episodio que esta inteiro no disco com outro nome.
         let dest_real = existente.unwrap_or_else(|| dest.clone());
 
-        let (status, error) = if !ep.available() {
-            // Episodio pago entra na lista para o usuario ver que existe, mas
-            // nunca vira download; sem midia, idem, por outro motivo.
+        let (status, error) = if !media::episode_available(series.source, ep) {
+            // Episodio fora do alcance da conta entra na lista para o usuario
+            // ver que existe, mas nunca vira download; sem midia, idem. O
+            // CandyJar trancado nao chega aqui: paywall quebrado no nucleo.
             let motivo = if ep.locked {
                 ep.lock_reason.clone()
             } else {
