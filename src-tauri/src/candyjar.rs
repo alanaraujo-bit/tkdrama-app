@@ -36,13 +36,21 @@
 //! FRONTIERA do bloqueio sai na propria pagina com `isLocked:false` e
 //! `streamUrl` completo (playlist 200 sem cookie) — entao aquele episodio
 //! "pago" tambem e resolvido quando o payload traz midia (ver
-//! `resolve_media`). Os demais episodios trancados NAO levam midia no SSR:
-//! a pagina so carrega o componente de paywall, e o erro honesto continua
-//! sendo o de episodio pago.
+//! `resolve_media`). Os demais episodios trancados NAO levam midia no SSR —
+//! para esses (`isLocked`+`isBlocked`, os "profundos" do paywall) a pagina so
+//! carrega o componente de paywall; antes de dar o erro honesto de episodio
+//! pago, `resolve_media` tenta a mesma XHR que o player web faz ao desbloquear
+//! por moedas — `POST /api/unlock/:seriesId/episode/:episodeId` com os cookies
+//! da sessao e headers `visitor-id`/`session-info` extraidos da propria pagina
+//! (ver `attempt_unlock`). Aceito o desbloqueio, a midia sai no SSR novo: se
+//! re-baixa a pagina, como o player faz com `router.refresh()`.
+
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use crate::media::{Episode, Gear, Series, Source, Trailer, UA};
 
@@ -481,6 +489,251 @@ fn pick_stream(streams: &[Value]) -> Option<&Value> {
         .or_else(|| streams.iter().find(tem_url))
 }
 
+/// Parseia todos os objetos `episodeStream` da pagina de um episodio.
+fn streams_from_page(html: &str, number: u32) -> Result<Vec<Value>> {
+    let blob = next_f_text(html);
+
+    // A pagina pode carregar mais de um `episodeStream` — e e exatamente isso
+    // que o paywall do CandyJar deixa escapar: no episodio trancado o primeiro
+    // vem com `isLocked` e sem midia, mas um segundo traz a `streamUrl`
+    // completa (e a playlist responde 200 mesmo sem cookie).
+    let raws = extract_json_all(&blob, "episodeStream");
+    if raws.is_empty() {
+        bail!("episodio {number} nao existe mais")
+    }
+    let mut streams: Vec<Value> = Vec::with_capacity(raws.len());
+    for raw in &raws {
+        let v: Value =
+            serde_json::from_str(raw).context("dados do episodio do CandyJar ilegiveis")?;
+        streams.push(v);
+    }
+    Ok(streams)
+}
+
+/// Da midia escolhida (`pick_stream`), busca a master playlist e devolve as
+/// URLs finais — o fim comum de todos os caminhos de `resolve_media`.
+async fn media_from_stream(
+    client: &reqwest::Client,
+    number: u32,
+    stream: &Value,
+) -> Result<(String, Option<String>)> {
+    let stream_url = as_str(stream.get("streamUrl"));
+    if stream_url.is_empty() {
+        bail!("episodio {number} sem midia acessivel")
+    }
+    let master = get_text(client, &stream_url).await?;
+    select_variant(&master, &stream_url)
+}
+
+/// Replica a XHR de desbloqueio do player web (rotas mapeadas no bundle —
+/// modulo 78815): `POST /api/unlock/:seriesId/episode/:episodeId`, com o
+/// cookie da sessao e os headers que a fabrica do client paywall (modulo
+/// 3161) injeta em TODA requisicao:
+///
+/// - `visitor-id` — o `visitorId` que o SSR embute na pagina;
+/// - `session-info` — `JSON.stringify(initialSessionInfo)` do proprio SSR,
+///   exatamente o que o SessionPersister da layout grava no localStorage.
+///
+/// O corpo segue o schema de body do unlock (modulo 73228): `cost`,
+/// `episodeNumber` e branch sao os mesmos valores que a pagina ja embute na
+/// listagem — a mesma fonte que o player web usa (`t.cost`, `branchData`).
+///
+/// Devolve `Ok(Some(status))` quando a origem respondeu (2xx = aceitou; a
+/// midia so sai num SSR novo, como o player faz com `router.refresh()`;
+/// 401/402/403/412 = conta sem moedas/unlimited) e `Ok(None)` quando a pagina
+/// nao traz precondicao necessaria para enviar.
+async fn attempt_unlock(
+    client: &reqwest::Client,
+    series_id: &str,
+    number: u32,
+    html: &str,
+    streams: &[Value],
+    cookie: &str,
+) -> Result<Option<u16>> {
+    let blob = next_f_text(html);
+
+    let visitor_id = scalar_string(&blob, "visitorId").filter(|s| !s.is_empty());
+    // O trecho recortado ja e o JSON que vai para o localStorage — cru basta.
+    let session_info = extract_json_all(&blob, "initialSessionInfo")
+        .into_iter()
+        .next()
+        .map(str::to_string);
+    let branch = extract_json_all(&blob, "branchData")
+        .into_iter()
+        .next()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+
+    // Custo e id do episodio: da listagem embutida na pagina (o `id` do item
+    // e o mesmo `episodeStream.id`). Sem a lista nao ha como montar o body.
+    let item = episode_item_for(&blob, number as u64);
+
+    let (Some(visitor_id), Some(session_info), Some(branch), Some((cost, list_id))) =
+        (visitor_id, session_info, branch, item)
+    else {
+        return Ok(None);
+    };
+    let branch_name = as_str(branch.get("name"));
+    if branch_name.is_empty() {
+        return Ok(None);
+    }
+    // O player envia `episodeId: t.id` — o id do episodio da pagina. Se por
+    // acaso os objetos `episodeStream` nao trazem, a lista embutida tem.
+    let episode_id = streams
+        .iter()
+        .map(|s| as_u64(s.get("id")))
+        .find(|v| *v > 0)
+        .unwrap_or(list_id);
+    if episode_id == 0 {
+        return Ok(None);
+    }
+
+    let unlimited = scalar_bool(&blob, "hasActiveUnlimitedEntitlement").unwrap_or(false);
+    let body = serde_json::json!({
+        "deviceUnixTime": now_millis(),
+        "branchId": as_u64(branch.get("id")),
+        "branchName": branch_name,
+        "episodeNumber": number as u64,
+        "cost": cost,
+        "autoUnlocked": false,
+        "autoUnlockNextEpisode": false,
+        "hasActiveUnlimitedSubscription": unlimited,
+    });
+
+    let url = format!("{BASE}/api/unlock/{series_id}/episode/{episode_id}");
+    let mut req = client
+        .post(&url)
+        .header("User-Agent", UA)
+        .header("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8")
+        .header("Referer", BASE)
+        .header("visitor-id", visitor_id)
+        .header("session-info", session_info);
+    if !cookie.is_empty() {
+        req = req.header("Cookie", cookie);
+    }
+    // Sem o feature `json` do reqwest: corpo serializado + Content-Type.
+    let body_text = serde_json::to_string(&body)?;
+    let resp = req
+        .header("Content-Type", "application/json")
+        .body(body_text)
+        .send()
+        .await
+        .context("falha ao desbloquear episodio no CandyJar")?;
+    Ok(Some(resp.status().as_u16()))
+}
+
+/// Escalar string apos `"key":` num blob `__next_f` — para chaves cujo valor
+/// NAO e objeto/array, as quais `extract_json_all` de proposito pula.
+fn scalar_string(text: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":");
+    let bytes = text.as_bytes();
+    let idx = text.find(&pat)?;
+    let mut i = idx + pat.len();
+    while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let start = i + 1;
+    let mut j = start;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => break,
+            _ => j += 1,
+        }
+    }
+    (j < bytes.len()).then(|| text[start..j].to_string())
+}
+
+/// Escalar booleano apos `"key":` num blob `__next_f`.
+fn scalar_bool(text: &str, key: &str) -> Option<bool> {
+    let pat = format!("\"{key}\":");
+    let idx = text.find(&pat)?;
+    let rest = text[idx + pat.len()..].trim_start();
+    if let Some(v) = rest.strip_prefix("true") {
+        return (!v.starts_with(|c: char| c.is_ascii_alphabetic())).then_some(true);
+    }
+    if let Some(v) = rest.strip_prefix("false") {
+        return (!v.starts_with(|c: char| c.is_ascii_alphabetic())).then_some(false);
+    }
+    None
+}
+
+/// Item do episodio atual na listagem embutida da pagina — a mesma fonte que o
+/// player web usa para `cost` e `id`; devolve (custo, id).
+///
+/// Os itens nao chegam num array `"episodes":[...]`: sao objetos JSON planos,
+/// um por episodio, em linhas RSC separadas (`3f:{"episodeNumber":15,...}`) e
+/// dentro de listas tipo `episodesList`. O scan procura cada objeto que abre
+/// com `{"episodeNumber":N` (sempre a primeira chave do item), recorta o
+/// objeto completo por contagem de chaves e devolve o primeiro que traga
+/// `cost` E `id` — o wrapper da pagina tem o numero mas nem custo nem id.
+fn episode_item_for(blob: &str, number: u64) -> Option<(u64, u64)> {
+    let pat = format!("{{\"episodeNumber\":{number}");
+    let bytes = blob.as_bytes();
+    let mut search_from = 0usize;
+    while search_from < blob.len() {
+        let Some(rel) = blob[search_from..].find(&pat) else { break };
+        let start = search_from + rel;
+        // Delimita o numero: `{"episodeNumber":1` nao pode casar com `:12`.
+        if !matches!(bytes.get(start + pat.len()), Some(b',') | Some(b'}')) {
+            search_from = start + 1;
+            continue;
+        }
+        let Some(raw) = object_from_open(blob, start) else { break };
+        if let Ok(it) = serde_json::from_str::<Value>(raw) {
+            // `as_u64` devolve 0 para campo ausente — presenca vale mais que valor.
+            if it.get("cost").is_some() && it.get("id").is_some() {
+                return Some((as_u64(it.get("cost")), as_u64(it.get("id"))));
+            }
+        }
+        search_from = start + 1;
+    }
+    None
+}
+
+/// Recorta um objeto JSON que abre em `open`, respeitando strings com escape —
+/// a mesma contagem de chaves de [`extract_json_all`], sem achar a chave.
+fn object_from_open<'a>(text: &'a str, open: usize) -> Option<&'a str> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut j = open;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        } else if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&text[open..=j]);
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// `Date.now()` do player: milissegundos desde a epoca Unix.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Resolve a midia de um episodio: pagina do episodio -> `episodeStream` (a
 /// ocorrencia que carrega midia, ver `pick_stream`) -> master playlist ->
 /// (playlist de video, playlist de audio quando separada).
@@ -491,6 +744,13 @@ fn pick_stream(streams: &[Value]) -> Option<&Value> {
 /// como entradas separadas e junta no mux. Conteudo mais antigo (visto em
 /// trailers) chega em MPEG-TS classico com audio ja embutido na variante —
 /// aqui `None`, e uma unica entrada basta.
+///
+/// Quando o SSR nao traz midia e ha sinal de cadeado (o caso dos episodios
+/// "profundos" do paywall), replica a XHR de desbloqueio do player web
+/// (`attempt_unlock`) com os cookies da sessao; aceito, re-baixa a pagina —
+/// como o player faz com `router.refresh()` no 200 — e procura a midia que
+/// entao sai no payload. Sem isso (rejeicao ou sem precondicao), o erro
+/// honesto continua sendo o de episodio pago.
 pub async fn resolve_media(
     client: &reqwest::Client,
     lang: &str,
@@ -499,44 +759,43 @@ pub async fn resolve_media(
     locked: bool,
     cookie: &str,
 ) -> Result<(String, Option<String>)> {
-    let html = get_html(client, &episode_url(lang, id, number), cookie).await?;
-    let blob = next_f_text(&html);
-
-    // A pagina pode carregar mais de um `episodeStream` — e e exatamente isso
-    // que o paywall do CandyJar deixa escapar: no episodio trancado o primeiro
-    // vem com `isLocked` e sem midia, mas um segundo traz a `streamUrl`
-    // completa (e a playlist responde 200 mesmo sem cookie).
-    let raws = extract_json_all(&blob, "episodeStream");
-    if raws.is_empty() {
-        bail!("episodio {number} nao existe mais");
-    }
-    let mut streams: Vec<Value> = Vec::with_capacity(raws.len());
-    for raw in &raws {
-        let v: Value =
-            serde_json::from_str(raw).context("dados do episodio do CandyJar ilegiveis")?;
-        streams.push(v);
-    }
+    let url = episode_url(lang, id, number);
+    let html = get_html(client, &url, cookie).await?;
+    let streams = streams_from_page(&html, number)?;
 
     // O "cadeado" e so uma flag do payload: qualquer ocorrencia com `streamUrl`
     // completo ja resolve o episodio, preferindo a que nao vem trancada. A
     // marca da listagem (`locked`) e o que se sabia ANTES desta requisicao —
     // ela nunca mais pula a pagina; serve so para decidir o motivo do erro.
-    let stream = match pick_stream(&streams) {
-        Some(s) => s,
-        None if streams.iter().any(|s| as_bool(s.get("isLocked"))) || locked => {
-            bail!("{PAID_HINT}")
-        }
-        None => bail!("episodio {number} sem midia acessivel"),
-    };
-
-    let stream_url = as_str(stream.get("streamUrl"));
-    if stream_url.is_empty() {
-        bail!("episodio {number} sem midia acessivel");
+    if let Some(stream) = pick_stream(&streams) {
+        return media_from_stream(client, number, stream).await;
     }
 
-    let master = get_text(client, &stream_url).await?;
-    select_variant(&master, &stream_url)
+    // Sem midia no SSR: ou o episodio de fato nao tem nada (sem sinal de
+    // cadeado), ou e um trancado profundo — so a XHR do player web abre.
+    if !(streams.iter().any(|s| as_bool(s.get("isLocked"))) || locked) {
+        bail!("episodio {number} sem midia acessivel")
+    }
+
+    match attempt_unlock(client, id, number, &html, &streams, cookie).await? {
+        Some(status) if (200..300).contains(&status) => {
+            // Origem aceitou o desbloqueio — a midia so aparece num SSR novo.
+            let html = get_html(client, &url, cookie)
+                .await
+                .context("rebuscando a pagina apos o desbloqueio")?;
+            let streams = streams_from_page(&html, number)?;
+            match pick_stream(&streams) {
+                Some(stream) => media_from_stream(client, number, stream).await,
+                // Aceitou mas nada saiu para esta sessao: honesto e pago.
+                None => bail!("{PAID_HINT}"),
+            }
+        }
+        // Rejeitado (401/402/403/412...) — o status ajuda a diagnostica-la.
+        Some(status) => bail!("{PAID_HINT} (HTTP {status})"),
+        None => bail!("{PAID_HINT}"),
+    }
 }
+
 
 /// Resolve uma referencia da playlist contra a URL de onde ela veio.
 fn absolute(reference: &str, base: &str) -> String {
@@ -782,6 +1041,47 @@ mod tests {
         assert!(pick_stream(&sem_nada).is_none());
     }
 
+    /// Escalares (`visitorId`, `hasActiveUnlimitedEntitlement`) nao sao
+    /// objetos/arrays: `extract_json_all` os pula e quem os le e o par
+    /// `scalar_string`/`scalar_bool`.
+    #[test]
+    fn escalares_do_blob_sao_extraidos() {
+        let text =
+            r#""visitorId":"bf0e-1234","x":1,"hasActiveUnlimitedEntitlement":false,"initialSessionInfo":{"visitId":"v"}"#;
+        assert_eq!(scalar_string(text, "visitorId").as_deref(), Some("bf0e-1234"));
+        assert_eq!(scalar_bool(text, "hasActiveUnlimitedEntitlement"), Some(false));
+        // Chave homonima parcial nao pode dar positivo: so o par chave+dois-pontos exato.
+        assert_eq!(scalar_bool(text, "hasActiveUnlimitedSubscription"), None);
+        assert_eq!(scalar_string(text, "visitorIdExtra").as_deref(), None);
+    }
+
+    /// A listagem embutida da pagina do episodio traz `cost` e `id` por item —
+    /// a mesma fonte que o player web usa no body do unlock. O rotulo de
+    /// traducao `"episodes":"Episodes"` tem que ser pulado.
+    #[test]
+    fn item_da_listagem_embutida_traz_custo_e_id() {
+        let text = r#""episodes":"Episodes","episodes":[{"episodeNumber":14,"cost":0,"id":52745},{"episodeNumber":15,"isLocked":true,"cost":50,"isBlocked":true,"id":52747}]"#;
+        assert_eq!(episode_item_for(text, 15), Some((50, 52747)));
+        assert_eq!(episode_item_for(text, 14), Some((0, 52745)));
+        assert_eq!(episode_item_for(text, 99), None);
+    }
+
+    /// Formato real da pagina decodificada: itens como linhas RSC separadas
+    /// (`3f:{...}`) e dentro de `episodesList` — sem array `"episodes":[...]`.
+    /// O wrapper tem o mesmo numero mas nem custo nem id: tem que ser pulado.
+    #[test]
+    fn item_da_listagem_real_chega_em_linhas_rsc() {
+        let text = r#"..."EpisodesDetailsContainer"]
+3f:{"episodeNumber":15,"isTrailer":false,"isLocked":true,"cost":50,"id":52747}"#;
+        assert_eq!(episode_item_for(text, 15), Some((50, 52747)));
+        // Item de episodio livre dentro da lista completa: custo zero e id.
+        let list = r#"..."episodesList":[{"episodeNumber":1,"isLocked":false,"cost":0,"id":52690},{"episodeNumber":15,"isLocked":true,"cost":50,"id":52747}]"#;
+        assert_eq!(episode_item_for(list, 1), Some((0, 52690)));
+        // Numero do wrapper so aparece no wrapper (sem custo/id): None.
+        let wrap = r#"{"episodeNumber":15,"episodesList":[{"episodeNumber":1,"cost":0,"id":52690}]}"#;
+        assert_eq!(episode_item_for(wrap, 15), None);
+    }
+
     /// `extract_json_all` recolhe CADA ocorrencia da chave, em ordem — a base
     /// de que o episodio trancado tem dois `episodeStream` na mesma pagina.
     #[test]
@@ -966,6 +1266,23 @@ mod tests {
                 }
             }
             println!("{}", linha.trim_end());
+        }
+    }
+
+    /// XHR de desbloqueio num episodio trancado profundo (serie 725): com
+    /// cookie vazio a origem deve rejeitar (sem conta/moedas) — o que ja
+    /// valida URL/verbos/body no ar; com o cookie real do app, espera-se 200
+    /// e midia no SSR novo. Rodar com:
+    /// cargo test --lib sonde_unlock_profundo -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn sonde_unlock_profundo() {
+        let client = reqwest::Client::new();
+        for number in [15u32, 42] {
+            match resolve_media(&client, "pt", "725", number, true, "").await {
+                Ok((video, audio)) => println!("ep{number}=OK video={video} audio={audio:?}"),
+                Err(e) => println!("ep{number}=ERR({e})"),
+            }
         }
     }
 
