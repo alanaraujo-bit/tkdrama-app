@@ -406,20 +406,20 @@ pub async fn fetch_series(
             // A duracao real so vem depois de baixar (medida no MP4); a
             // origem nao a declara na listagem nem na pagina do episodio.
             duration: 0,
-            gears: if locked {
-                Vec::new()
-            } else {
-                vec![Gear {
-                    gear_name: GEAR_NAME.into(),
-                    codec: "h264".into(),
-                    width: 0,
-                    height: 0,
-                    bitrate: 1,
-                    size: 0,
-                    // Resolvida na hora de baixar: video + audio, ver `resolve_media`.
-                    urls: Vec::new(),
-                }]
-            },
+            // O cadeado da listagem nao impede a midia: o episodio trancado
+            // carrega stream completo na propria pagina (paywall quebrado — ver
+            // `pick_stream`). Entao todo episodio sai com um gear de reserva;
+            // as URLs so existem apos baixar, quando `resolve_media` consulta a
+            // pagina do episodio.
+            gears: vec![Gear {
+                gear_name: GEAR_NAME.into(),
+                codec: "h264".into(),
+                width: 0,
+                height: 0,
+                bitrate: 1,
+                size: 0,
+                urls: Vec::new(),
+            }],
             locked,
             lock_reason: if !locked {
                 String::new()
@@ -806,14 +806,17 @@ mod tests {
         assert!(ep1.available());
         // O corte exato de onde comeca o bloqueio varia (a origem faz teste
         // A/B de lancamento por sessao — `branchData` na pagina). O que nao
-        // pode variar e o CONTRATO: todo episodio trancado fica sem midia.
+        // pode variar e o CONTRATO: trancado sai da listagem com gear de
+        // reserva e motivo do bloqueio; as URLs so existem apos baixar.
         assert!(
             series.episodes.iter().any(|e| e.locked),
             "esperava pelo menos um episodio trancado/bloqueado nessa novela"
         );
         for ep in &series.episodes {
             if ep.locked {
-                assert!(ep.gears.is_empty(), "episodio trancado nao pode carregar midia");
+                // Paywall quebrado no nucleo: o cadeado nao impede a midia.
+                assert!(!ep.gears.is_empty(), "trancado precisa de gear de reserva");
+                assert!(ep.gears[0].urls.is_empty(), "listagem nao resolve midia");
                 assert!(!ep.lock_reason.is_empty());
             }
         }
