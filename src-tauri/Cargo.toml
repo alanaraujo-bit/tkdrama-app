@@ -1,6 +1,6 @@
 [package]
 name = "tkdrama-app"
-version = "1.2.1"
+version = "1.2.2"
 description = "Baixa novelas verticais do TikTok"
 authors = ["Alan Araujo"]
 edition = "2021"
