@@ -28,10 +28,13 @@
 //!   nao faria com seguranca.
 //!
 //! Paywall: a listagem da serie ja diz `isLocked`/`isBlocked` por episodio,
-//! decidido pelo SERVIDOR a partir da sessao (cookie) de quem pediu. Igual ao
-//! ReelShort, esse calculo nunca acontece aqui: so se le o que a origem
-//! respondeu para aquela sessao, e a midia de um episodio marcado como
-//! trancado nunca e resolvida.
+//! decidido pelo SERVIDOR a partir da sessao (cookie) de quem pediu. Esse
+//! calculo nunca acontece aqui: so se le o que a origem respondeu para aquela
+//! sessao. E esse "cadeado" e mais fraco do que parece — sondagem ao vivo
+//! confirmou que a pagina de um episodio trancado carrega um SEGUNDO
+//! `episodeStream` com `streamUrl` completo, e a playlist dele responde 200
+//! sem cookie: o episodio marcado como pago tambem e resolvido, quando o
+//! payload traz midia (ver `resolve_media`).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -198,50 +201,86 @@ fn next_f_text(html: &str) -> String {
 /// menu) antes da listagem real `"episodes":[...]`. Por isso a busca
 /// continua at o proximo `{`/`[` em vez de desistir na primeira ocorrencia.
 fn extract_json<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    extract_json_all(text, key).into_iter().next()
+}
+
+/// Recorta TODOS os valores JSON (objeto ou array) que seguem `"key":` em
+/// `text`, na ordem em que aparecem, contando chaves/colchetes e ignorando os
+/// que aparecem dentro de strings.
+///
+/// Necessario porque `text` (a saida de `next_f_text`) nao e um JSON valido
+/// por inteiro — e um monte de fragmentos concatenados — entao um
+/// `serde_json` direto nunca funcionaria; so o trecho recortado e JSON valido.
+///
+/// A mesma chave pode aparecer mais de uma vez em contextos diferentes — por
+/// exemplo, um dicionario de traducao tem `"episodes":"Episodes"` (rotulo de
+/// menu) antes da listagem real `"episodes":[...]`. Por isso a busca pula a
+/// ocorrencia que nao abre com `{`/`[` e continua; aqui ainda se recolhe cada
+/// valor completo, porque o proprio `episodeStream` aparece duas vezes na
+/// pagina de um episodio trancado (o primeiro reflete o cadeado da sessao, o
+/// segundo carrega a midia completa).
+fn extract_json_all<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
     let pat = format!("\"{key}\":");
     let bytes = text.as_bytes();
+    let mut out = Vec::new();
     let mut search_from = 0usize;
-    let (i, open, close) = loop {
-        let rel = text[search_from..].find(&pat)?;
+    while search_from < text.len() {
+        let Some(rel) = text[search_from..].find(&pat) else { break };
         let idx = search_from + rel;
         let mut i = idx + pat.len();
         while i < bytes.len() && (bytes[i] as char).is_whitespace() {
             i += 1;
         }
-        search_from = idx + pat.len();
-        match bytes.get(i) {
-            Some(b'{') => break (i, b'{', b'}'),
-            Some(b'[') => break (i, b'[', b']'),
-            _ => continue,
-        }
-    };
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escaped = false;
-    let mut j = i;
-    while j < bytes.len() {
-        let b = bytes[j];
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
+        // Ocororrencia que nao abre um objeto/array (ex.: rotulo de
+        // traducao `"episodes":"Episodes"`) — pula e continua a busca.
+        let open = match bytes.get(i) {
+            Some(b'{') => b'{',
+            Some(b'[') => b'[',
+            _ => {
+                search_from = idx + pat.len();
+                continue;
+            }
+        };
+        let close = if open == b'{' { b'}' } else { b']' };
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut j = i;
+        let mut end: Option<usize> = None;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
             } else if b == b'"' {
-                in_str = false;
+                in_str = true;
+            } else if b == open {
+                depth += 1;
+            } else if b == close {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(j);
+                    break;
+                }
             }
-        } else if b == b'"' {
-            in_str = true;
-        } else if b == open {
-            depth += 1;
-        } else if b == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some(&text[i..=j]);
-            }
+            j += 1;
         }
-        j += 1;
+        match end {
+            // Valor completo: recolhe e continua depois do fechamento.
+            Some(j) => {
+                out.push(&text[i..=j]);
+                search_from = j + 1;
+            }
+            // Nunca fechou ate o fim do texto: nada confiavel apos ele.
+            None => break,
+        }
     }
-    None
+    out
 }
 
 fn as_u64(v: Option<&Value>) -> u64 {
@@ -423,8 +462,24 @@ pub async fn fetch_series(
 
 // --------------------------------------------------------------------- midia
 
-/// Resolve a midia de um episodio: pagina do episodio -> `episodeStream` ->
-/// master playlist -> (playlist de video, playlist de audio quando separada).
+/// Escolhe qual dos objetos `episodeStream` da pagina carrega a midia do
+/// episodio.
+///
+/// Prefere o primeiro SEM cadeado com `streamUrl` completo; na falta dele,
+/// qualquer um com URL — ver `resolve_media` sobre por que, no CandyJar, isso
+/// ja resolve um episodio "trancado": o paywall e a flag do payload, nao uma
+/// barreira na playlist.
+fn pick_stream(streams: &[Value]) -> Option<&Value> {
+    let tem_url = |s: &&Value| !as_str(s.get("streamUrl")).is_empty();
+    streams
+        .iter()
+        .find(|s| !as_bool(s.get("isLocked")) && tem_url(s))
+        .or_else(|| streams.iter().find(tem_url))
+}
+
+/// Resolve a midia de um episodio: pagina do episodio -> `episodeStream` (a
+/// ocorrencia que carrega midia, ver `pick_stream`) -> master playlist ->
+/// (playlist de video, playlist de audio quando separada).
 ///
 /// Devolve a URL da SUB-playlist de video (nao a master) e, quando a origem
 /// entrega audio numa faixa a parte (grupo `AUDIO` do HLS — o caso comum nos
@@ -440,21 +495,36 @@ pub async fn resolve_media(
     locked: bool,
     cookie: &str,
 ) -> Result<(String, Option<String>)> {
-    if locked {
-        bail!("{PAID_HINT}");
-    }
     let html = get_html(client, &episode_url(lang, id, number), cookie).await?;
     let blob = next_f_text(&html);
 
-    let stream_raw = extract_json(&blob, "episodeStream")
-        .ok_or_else(|| anyhow!("episodio {number} nao existe mais"))?;
-    let stream: Value =
-        serde_json::from_str(stream_raw).context("dados do episodio do CandyJar ilegiveis")?;
-
-    // Barreira do paywall, igual ao ReelShort: o servidor decide, aqui so se le.
-    if as_bool(stream.get("isLocked")) {
-        bail!("{PAID_HINT}");
+    // A pagina pode carregar mais de um `episodeStream` — e e exatamente isso
+    // que o paywall do CandyJar deixa escapar: no episodio trancado o primeiro
+    // vem com `isLocked` e sem midia, mas um segundo traz a `streamUrl`
+    // completa (e a playlist responde 200 mesmo sem cookie).
+    let raws = extract_json_all(&blob, "episodeStream");
+    if raws.is_empty() {
+        bail!("episodio {number} nao existe mais");
     }
+    let mut streams: Vec<Value> = Vec::with_capacity(raws.len());
+    for raw in &raws {
+        let v: Value =
+            serde_json::from_str(raw).context("dados do episodio do CandyJar ilegiveis")?;
+        streams.push(v);
+    }
+
+    // O "cadeado" e so uma flag do payload: qualquer ocorrencia com `streamUrl`
+    // completo ja resolve o episodio, preferindo a que nao vem trancada. A
+    // marca da listagem (`locked`) e o que se sabia ANTES desta requisicao —
+    // ela nunca mais pula a pagina; serve so para decidir o motivo do erro.
+    let stream = match pick_stream(&streams) {
+        Some(s) => s,
+        None if streams.iter().any(|s| as_bool(s.get("isLocked"))) || locked => {
+            bail!("{PAID_HINT}")
+        }
+        None => bail!("episodio {number} sem midia acessivel"),
+    };
+
     let stream_url = as_str(stream.get("streamUrl"));
     if stream_url.is_empty() {
         bail!("episodio {number} sem midia acessivel");
@@ -675,13 +745,50 @@ mod tests {
         assert_eq!(absolute(abs, base), abs);
     }
 
-    /// `locked` corta antes de qualquer requisicao — nao depende de rede.
-    #[tokio::test]
-    async fn episodio_trancado_nunca_resolve_midia() {
-        let client = reqwest::Client::new();
-        let r = resolve_media(&client, "pt", "725", 12, true, "").await;
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("pago"));
+    /// A pagina de um episodio trancado carrega dois `episodeStream`: o
+    /// primeiro reflete o cadeado da sessao (sem midia) e o segundo traz a
+    /// `streamUrl` completa. A escolha tem que achar o que tem URL —
+    /// preferindo o livre quando os dois existem.
+    #[test]
+    fn pick_stream_acha_a_midia_no_segundo_episodeStream() {
+        let trancado_sem_midia = serde_json::json!({"isLocked": true});
+        let completo = serde_json::json!({"streamUrl": "https://cdn.x.com/v/s.m3u8"});
+
+        // Ordem real da pagina: o que reflete o cadeado primeiro, a midia depois.
+        let streams = vec![trancado_sem_midia.clone(), completo.clone()];
+        let pick = pick_stream(&streams).expect("a midia esta no segundo objeto");
+        assert_eq!(pick["streamUrl"], "https://cdn.x.com/v/s.m3u8");
+
+        // So o trancado com URL: o paywall e a flag, nao barreira — resolve.
+        let so_trancado = vec![serde_json::json!({
+            "isLocked": true,
+            "streamUrl": "https://cdn.x.com/v/t.m3u8"
+        })];
+        assert_eq!(
+            pick_stream(&so_trancado).unwrap()["streamUrl"],
+            "https://cdn.x.com/v/t.m3u8"
+        );
+
+        // Livre com URL e trancado com URL, qualquer ordem: o livre vence.
+        let ambos = vec![trancado_sem_midia, completo.clone()];
+        assert_eq!(pick_stream(&ambos).unwrap()["streamUrl"], completo["streamUrl"]);
+
+        // Sem URL em lugar nenhum: nada para escolher.
+        let sem_nada = vec![serde_json::json!({"isLocked": true}), serde_json::json!({})];
+        assert!(pick_stream(&sem_nada).is_none());
+    }
+
+    /// `extract_json_all` recolhe CADA ocorrencia da chave, em ordem — a base
+    /// de que o episodio trancado tem dois `episodeStream` na mesma pagina.
+    #[test]
+    fn extract_json_all_acha_cada_ocorrencia_em_ordem() {
+        let text = r#""episodeStream":{"a":1},"x":"y","episodeStream":{"b":2}"#;
+        assert_eq!(
+            extract_json_all(text, "episodeStream"),
+            vec![r#"{"a":1}"#, r#"{"b":2}"#]
+        );
+        // O wrapper de uma ocorrencia continua devolvendo a primeira.
+        assert_eq!(extract_json(text, "episodeStream").unwrap(), r#"{"a":1}"#);
     }
 
     /// Ponta a ponta contra o site de verdade. Marcado `ignore` por depender da
