@@ -62,9 +62,11 @@ const SOURCE_LABEL: Record<string, string> = {
   dramabox: "DramaBox",
 };
 
-/** Da para baixar? Espelha `Episode::available()` no Rust. */
-function available(ep: Episode): boolean {
-  return !ep.locked && ep.gears.length > 0;
+/** Da para baixar? Espelha `episode_available()` em media.rs — o CandyJar
+ * trancado entra: paywall quebrado no nucleo, midia completa via segundo stream. */
+function available(ep: Episode, source: SourceName): boolean {
+  if (!ep.gears.length) return false; // sem midia nenhuma fonte salva
+  return source === "candyjar" || !ep.locked;
 }
 
 interface Task {
@@ -559,7 +561,8 @@ async function refreshOnDisk(nome: string) {
 /** Falta baixar? Um episódio bloqueado não conta como faltando. */
 function missingEpisodes(): Episode[] {
   if (!series) return [];
-  return series.episodes.filter((ep) => available(ep) && !onDisk.have.has(ep.number));
+  const src = series.source;
+  return series.episodes.filter((ep) => available(ep, src) && !onDisk.have.has(ep.number));
 }
 
 function renderPicker() {
@@ -574,7 +577,7 @@ function renderPicker() {
     b.textContent = String(ep.number);
     b.dataset.ep = String(ep.number);
 
-    if (!available(ep)) {
+    if (!available(ep, series.source)) {
       b.classList.add("is-blocked");
       b.disabled = true;
       b.title = ep.locked
@@ -1786,7 +1789,8 @@ function wire() {
     btn.addEventListener("click", () => {
       if (!series) return;
       const kind = btn.dataset.pick;
-      const usable = series.episodes.filter(available);
+      const src = series.source;
+      const usable = series.episodes.filter((ep) => available(ep, src));
       if (kind === "all") setSelection(new Set(usable.map((e) => e.number)));
       else if (kind === "none") setSelection(new Set());
       else if (kind === "missing") {
@@ -1810,8 +1814,9 @@ function wire() {
     if ((e as MouseEvent).shiftKey && anchor !== null) {
       const next = new Set(selected);
       const [a, b] = anchor < n ? [anchor, n] : [n, anchor];
+      const src = series?.source;
       for (const ep of series?.episodes ?? []) {
-        if (ep.number >= a && ep.number <= b && available(ep)) next.add(ep.number);
+        if (src && ep.number >= a && ep.number <= b && available(ep, src)) next.add(ep.number);
       }
       setSelection(next);
       return;
