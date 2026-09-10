@@ -31,10 +31,14 @@
 //! decidido pelo SERVIDOR a partir da sessao (cookie) de quem pediu. Esse
 //! calculo nunca acontece aqui: so se le o que a origem respondeu para aquela
 //! sessao. E esse "cadeado" e mais fraco do que parece — sondagem ao vivo
-//! confirmou que a pagina de um episodio trancado carrega um SEGUNDO
-//! `episodeStream` com `streamUrl` completo, e a playlist dele responde 200
-//! sem cookie: o episodio marcado como pago tambem e resolvido, quando o
-//! payload traz midia (ver `resolve_media`).
+//! (serie 725, ~60 sessoes) mostrou um teste A/B de lancamento na origem:
+//! `branchData` nome A/B na pagina, por sessao. Num dos ramos o episodio da
+//! FRONTIERA do bloqueio sai na propria pagina com `isLocked:false` e
+//! `streamUrl` completo (playlist 200 sem cookie) — entao aquele episodio
+//! "pago" tambem e resolvido quando o payload traz midia (ver
+//! `resolve_media`). Os demais episodios trancados NAO levam midia no SSR:
+//! a pagina so carrega o componente de paywall, e o erro honesto continua
+//! sendo o de episodio pago.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -916,6 +920,94 @@ mod tests {
         assert!(info.faststart);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Em cada sessao nova, tenta resolver o PRIMEIRO, o MEIO e o ULTIMO
+    /// episodio trancado via `resolve_media` — mostra se os ramos A/B
+    /// liberam todos os
+    /// pagos ou so parte deles. Rodar com:
+    /// cargo test --lib sonde_ramos_pagos -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn sonde_ramos_pagos() {
+        for i in 0..16 {
+            let client = reqwest::Client::new();
+            let series = fetch_series(&client, "pt", "725", "")
+                .await
+                .expect("lista a serie");
+            let trancados: Vec<u32> = series
+                .episodes
+                .iter()
+                .filter(|e| e.locked)
+                .map(|e| e.number)
+                .collect();
+            if trancados.is_empty() {
+                println!("[{i}] total={} sem trancados", series.episodes.len());
+                continue;
+            }
+            let mut linha = format!(
+                "[{i}] total={} trancados_{}-{}: ",
+                series.episodes.len(),
+                trancados.first().unwrap(),
+                *trancados.last().unwrap()
+            );
+            let alvos = [
+                *trancados.first().unwrap(),
+                *trancados.get(trancados.len() / 2).unwrap_or_else(|| trancados.last().unwrap()),
+                *trancados.last().unwrap(),
+            ];
+            for alvo in alvos {
+                match resolve_media(&client, "pt", "725", alvo, true, "").await {
+                    Ok(_) => linha.push_str(&format!("ep{alvo}=OK ")),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        linha.push_str(&format!("ep{alvo}=ERR({msg}) "));
+                    }
+                }
+            }
+            println!("{}", linha.trim_end());
+        }
+    }
+
+    /// Sondagem do payload de um episodio trancado: despeja a pagina, o blob
+    /// __next_f, todas as ocorrencias de `episodeStream` e cada `streamUrl`
+    /// encontrado — para ver onde a midia real esta (ou se falta). Rodar com:
+    /// cargo test --lib sonda_pagina_de_trancado -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn sonda_pagina_de_trancado() {
+        let client = reqwest::Client::new();
+        for number in [12u32, 40] {
+            println!("===== episodio {number} =====");
+            let html = get_html(&client, &episode_url("pt", "725", number), "")
+                .await
+                .expect("pagina do episodio");
+            std::fs::write(
+                std::env::temp_dir().join(format!("cj_probe_ep{number}.html")),
+                &html,
+            )
+            .unwrap();
+            let blob = next_f_text(&html);
+            println!("html={} bytes, blob __next_f={} bytes", html.len(), blob.len());
+
+            for (i, raw) in extract_json_all(&blob, "episodeStream").iter().enumerate() {
+                println!("--- episodeStream[{i}] ({len} chars): {raw}", len = raw.len());
+            }
+
+            // Onde mais `streamUrl` aparece no blob?
+            let mut rest = &blob[..];
+            let mut achados = 0;
+            while let Some(pos) = rest.find("streamUrl") {
+                let fim = (pos + 350).min(rest.len());
+                println!("--- streamUrl ctx: {}", &rest[pos..fim]);
+                rest = &rest[fim.min(pos + 1)..]; // avança pelo menos 1
+                achados += 1;
+                if achados >= 6 {
+                    break;
+                }
+            }
+            println!("total de ocorrencias 'streamUrl' no blob: {achados}");
+        }
     }
 }
 
