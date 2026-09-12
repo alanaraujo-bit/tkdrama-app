@@ -183,6 +183,11 @@ pub fn episode_available(source: Source, ep: &Episode) -> bool {
 pub struct Theme {
     pub key: String,
     pub value: String,
+    /// Grupo da taxonomia da origem, quando ela agrupa (o `category_id` do
+    /// ReelShort separa genero, cliche, personagem, gatilho...). Vazio nas
+    /// fontes que nao agrupam.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
 }
 
 /// Numeros da plataforma de origem.

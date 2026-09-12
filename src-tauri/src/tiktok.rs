@@ -153,6 +153,7 @@ fn parse_themes(info: &Value) -> Vec<Theme> {
                     (!key.is_empty() || !value.is_empty()).then(|| Theme {
                         key: key.to_string(),
                         value: value.to_string(),
+                        ..Default::default()
                     })
                 })
                 .collect()

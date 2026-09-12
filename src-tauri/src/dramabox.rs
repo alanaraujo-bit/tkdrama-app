@@ -268,6 +268,7 @@ pub async fn fetch_series(
                 .map(|t| Theme {
                     key: as_str(t.get("id")),
                     value: as_str(t.get("name")),
+                    ..Default::default()
                 })
                 .filter(|t| !t.key.is_empty() || !t.value.is_empty())
                 .collect()

@@ -22,7 +22,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
-use crate::media::{Episode, Gear, Series, Source, UA};
+use crate::media::{Episode, Gear, Series, Source, Theme, UA};
 
 const BASE: &str = "https://www.reelshort.com";
 const DEFAULT_LANG: &str = "pt";
@@ -375,13 +375,37 @@ pub async fn fetch_series(
         episodes,
         source: Source::Reelshort,
         lang: lang.to_string(),
-        // O ReelShort nao publica temas, duracao total nem contadores de
-        // audiencia na pagina da serie. Ficam vazios, e o manifesto os omite.
-        themes: Vec::new(),
+        themes: parse_themes(d),
+        // Duracao total e contadores de audiencia ficam vazios, e o manifesto
+        // os omite.
         total_duration_sec: 0,
         upstream: Default::default(),
         is_limited_free: false,
     })
+}
+
+/// Temas da serie: `tag_list` da pagina, cru e na ordem do site.
+///
+/// Cada item e `{ id, category_id, text }`. O `id` e o identificador estavel;
+/// o `text` vem no idioma da conta/pagina (visto em portugues ate em `/en/`);
+/// o `category_id` agrupa a taxonomia — 1010 genero, 1010xxx subgenero, 1022
+/// cliches, 1020 personagens, 1024 gatilhos etc. (inferido pelo conteudo, o
+/// site nao documenta). Vai no `group` para quem exibe separar genero de
+/// cliche sem chutar pelo texto.
+fn parse_themes(d: &Value) -> Vec<Theme> {
+    d.get("tag_list")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .map(|t| Theme {
+                    key: as_str(t.get("id")),
+                    value: as_str(t.get("text")),
+                    group: as_str(t.get("category_id")),
+                })
+                .filter(|t| !t.key.is_empty() || !t.value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Playlist HLS -> lista ordenada de segmentos absolutos.
@@ -644,6 +668,27 @@ mod tests {
     use super::*;
 
     const BOOK: &str = "69d8612ad6461266e80b7a17";
+
+    /// Recorte real de `pageProps.data.tag_list` (serie BOOK, /pt/).
+    #[test]
+    fn temas_vem_do_tag_list_com_o_grupo() {
+        let d = serde_json::json!({
+            "tag": ["Romance Sombrio"],
+            "tag_list": [
+                { "id": "676d21074582b53a14081663", "category_id": "1000", "text": "Feminina" },
+                { "id": "676d210c4582b53a140819c1", "category_id": "1010", "text": "Romance" },
+                { "id": "676d210f4582b53a14081b84", "category_id": "1010001", "text": "Romance Sombrio" },
+                {}
+            ]
+        });
+        let themes = parse_themes(&d);
+        assert_eq!(themes.len(), 3);
+        assert_eq!(themes[1].key, "676d210c4582b53a140819c1");
+        assert_eq!(themes[1].value, "Romance");
+        assert_eq!(themes[1].group, "1010");
+        assert_eq!(themes[2].group, "1010001");
+        assert!(parse_themes(&serde_json::json!({})).is_empty());
+    }
 
     /// A vitrine acha novela em qualquer profundidade e nao repete.
     ///

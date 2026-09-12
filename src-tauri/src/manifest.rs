@@ -48,6 +48,10 @@ const IMG_EXT: [&str; 4] = ["jpg", "png", "webp", "avif"];
 pub struct Theme {
     pub key: String,
     pub value: String,
+    /// Grupo da taxonomia da origem (ReelShort: `category_id`). Omitido quando
+    /// a fonte nao agrupa.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
 }
 
 /// Numeros da plataforma de origem.
@@ -503,6 +507,7 @@ pub fn patch_series(m: &mut Manifest, s: &Series, poster: Option<String>) {
             .map(|t| Theme {
                 key: t.key.clone(),
                 value: t.value.clone(),
+                group: t.group.clone(),
             })
             .collect();
     }
@@ -890,6 +895,7 @@ mod tests {
             themes: vec![MediaTheme {
                 key: "tag_Contractlovers_Relationship".into(),
                 value: "Contract Lovers".into(),
+                ..Default::default()
             }],
             total_duration_sec: 4884,
             upstream: MediaUpstream {
