@@ -147,6 +147,22 @@ pub struct Settings {
     /// Abaixo deste espaco livre a rodada nem comeca.
     #[serde(default = "default_min_free")]
     pub auto_min_free_gb: f64,
+
+    // ------------------------------------------------------------------- cortes
+    /// Quantos clipes o lote diario tenta gerar. 0 desliga a geracao automatica
+    /// (mesma convencao de "0 = sem" dos tetos acima).
+    #[serde(default = "default_cortes_quota")]
+    pub cortes_daily_quota: usize,
+    /// Marca d'agua "Noveleiras de plantao" nos clipes (padrao ligado).
+    #[serde(default = "default_true")]
+    pub cortes_watermark: bool,
+    /// Marca embutida de origem: "remover" (padrao), "cobrir" ou "manter".
+    #[serde(default = "default_source_mark")]
+    pub cortes_source_mark: String,
+    /// Embalagem editorial dos clipes: gancho de abertura (episodio, titulo,
+    /// frase da sinopse) e cartao final (padrao ligado).
+    #[serde(default = "default_true")]
+    pub cortes_embalagem: bool,
 }
 
 fn default_interval() -> u64 {
@@ -160,6 +176,15 @@ fn default_max_gb() -> f64 {
 }
 fn default_min_free() -> f64 {
     10.0
+}
+fn default_cortes_quota() -> usize {
+    10
+}
+fn default_true() -> bool {
+    true
+}
+fn default_source_mark() -> String {
+    "remover".into()
 }
 
 impl Default for Settings {
@@ -176,6 +201,10 @@ impl Default for Settings {
             auto_max_new_series: default_max_series(),
             auto_max_gb_per_run: default_max_gb(),
             auto_min_free_gb: default_min_free(),
+            cortes_daily_quota: default_cortes_quota(),
+            cortes_watermark: default_true(),
+            cortes_source_mark: default_source_mark(),
+            cortes_embalagem: default_true(),
         }
     }
 }
@@ -209,6 +238,9 @@ pub struct AppState {
     /// Quando a ultima rodada automatica correu. Persistido para que fechar e
     /// reabrir o app nao dispare uma rodada imediata a cada vez.
     pub last_run: Mutex<u64>,
+    /// Quando o ultimo lote de cortes correu (unix secs). Persistido para o laco
+    /// diario disparar no maximo uma vez por dia mesmo apos fechar e reabrir.
+    pub cortes_last_run: Mutex<u64>,
     /// Serializa toda gravacao de `manifest.json`.
     ///
     /// Ate tres episodios da MESMA novela baixam ao mesmo tempo, e cada um
@@ -263,6 +295,7 @@ impl AppState {
             series_cache: Mutex::new(HashMap::new()),
             follows: Mutex::new(Vec::new()),
             last_run: Mutex::new(0),
+            cortes_last_run: Mutex::new(0),
             manifest_lock: Mutex::new(()),
             client,
             seq: AtomicU64::new(0),
@@ -323,6 +356,8 @@ struct Persisted {
     follows: Vec<crate::watch::Follow>,
     #[serde(default)]
     last_run: u64,
+    #[serde(default)]
+    cortes_last_run: u64,
 }
 
 pub fn save(app: &AppHandle) {
@@ -342,6 +377,7 @@ pub fn save(app: &AppHandle) {
         tasks,
         follows: state.follows.lock().unwrap().clone(),
         last_run: *state.last_run.lock().unwrap(),
+        cortes_last_run: *state.cortes_last_run.lock().unwrap(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&data) {
         let tmp = path.with_extension("json.tmp");
@@ -363,6 +399,7 @@ pub fn load(app: &AppHandle) {
     *state.settings.lock().unwrap() = data.settings;
     *state.follows.lock().unwrap() = data.follows;
     *state.last_run.lock().unwrap() = data.last_run;
+    *state.cortes_last_run.lock().unwrap() = data.cortes_last_run;
     let mut tasks = data.tasks;
     let max_seq = tasks.iter().map(|t| t.seq).max().unwrap_or(0);
     // Reconciliacao com o disco: o estado salvo e uma anotacao, o disco e a

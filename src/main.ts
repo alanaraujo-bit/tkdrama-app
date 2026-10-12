@@ -116,6 +116,39 @@ interface Settings {
   auto_max_new_series: number;
   auto_max_gb_per_run: number;
   auto_min_free_gb: number;
+  cortes_daily_quota: number;
+  cortes_watermark: boolean;
+  cortes_source_mark: string;
+}
+
+/** Um clipe já no disco. Espelha `cortes::ClipInfo`. */
+interface ClipInfo {
+  novela: string;
+  file: string;
+  sourceEpisode: string;
+  startSec: number;
+  endSec: number;
+  score: number;
+  generatedAt: string;
+  path: string;
+}
+
+/** Resumo do dia da aba Cortes. */
+interface CortesSummary {
+  day: string;
+  quota: number;
+  generated: number;
+  sourceMark: string;
+  clips: ClipInfo[];
+}
+
+/** Resultado de um lote. Espelha `cortes::LoteReport`. */
+interface CortesReport {
+  already: number;
+  generated: number;
+  quota: number;
+  deferred: boolean;
+  failures: string[];
 }
 
 /** Uma novela que o app revisita sozinho. Espelha `watch::Follow` no Rust. */
@@ -164,6 +197,9 @@ let settings: Settings = {
   auto_max_new_series: 10,
   auto_max_gb_per_run: 5,
   auto_min_free_gb: 10,
+  cortes_daily_quota: 10,
+  cortes_watermark: true,
+  cortes_source_mark: "remover",
 };
 let selected = new Set<number>();
 let freeBytes: number | null = null;
@@ -370,6 +406,9 @@ async function loadSettings() {
   $<HTMLInputElement>("#set-auto-series").value = String(settings.auto_max_new_series);
   $<HTMLInputElement>("#set-auto-gb").value = String(settings.auto_max_gb_per_run);
   $<HTMLInputElement>("#set-auto-free").value = String(settings.auto_min_free_gb);
+  $<HTMLInputElement>("#set-cortes-quota").value = String(settings.cortes_daily_quota);
+  $<HTMLInputElement>("#set-cortes-watermark").checked = settings.cortes_watermark;
+  $<HTMLSelectElement>("#set-cortes-source-mark").value = settings.cortes_source_mark;
 }
 
 async function saveSettings() {
@@ -388,6 +427,9 @@ async function saveSettings() {
     auto_max_new_series: num(Number($<HTMLInputElement>("#set-auto-series").value)),
     auto_max_gb_per_run: num(Number($<HTMLInputElement>("#set-auto-gb").value)),
     auto_min_free_gb: num(Number($<HTMLInputElement>("#set-auto-free").value)),
+    cortes_daily_quota: num(Number($<HTMLInputElement>("#set-cortes-quota").value)),
+    cortes_watermark: $<HTMLInputElement>("#set-cortes-watermark").checked,
+    cortes_source_mark: $<HTMLSelectElement>("#set-cortes-source-mark").value,
   };
   try {
     await invoke("settings_set", { settings: next });
@@ -397,6 +439,7 @@ async function saveSettings() {
     // O cabecalho do painel anuncia o intervalo: sem isto continuaria dizendo
     // o valor antigo ate a proxima recarga.
     renderFollows();
+    renderCortes();
     refreshDisk();
   } catch (e) {
     banner(String(e), "is-error");
@@ -637,10 +680,27 @@ function matchesWatch(f: Follow): boolean {
   }
 }
 
+/**
+ * Trabalho demorado em andamento, por tipo ("meta", "watch"). O rodapé mostra
+ * todos, de qualquer aba: o usuário não pode ter de adivinhar se algo está
+ * rodando, onde está e quanto falta.
+ */
+const atividades = new Map<string, string>();
+
+function setActivity(job: string, text: string) {
+  if (text) atividades.set(job, text);
+  else atividades.delete(job);
+  const el = $("#stat-activity");
+  el.textContent = [...atividades.values()].join(" · ");
+  el.hidden = atividades.size === 0;
+}
+
 function renderFollows() {
-  $("#watch-next").textContent = settings.auto_enabled
-    ? `verificando a cada ${settings.auto_interval_hours}h`
-    : "verificação automática desligada";
+  $("#watch-next").textContent =
+    atividades.get("watch") ??
+    (settings.auto_enabled
+      ? `verificando a cada ${settings.auto_interval_hours}h`
+      : "verificação automática desligada");
 
   const visiveis = follows.filter(matchesWatch);
 
@@ -759,6 +819,8 @@ async function runWatchNow() {
   } finally {
     btn.disabled = false;
     btn.textContent = "Verificar agora";
+    setActivity("watch", "");
+    renderFollows();
   }
 }
 
@@ -1261,6 +1323,7 @@ async function runMetadata() {
   } finally {
     btn.disabled = false;
     btn.textContent = "Atualizar metadados";
+    setActivity("meta", "");
   }
 }
 
@@ -1598,6 +1661,84 @@ async function refreshDisk() {
 // ------------------------------------------------------------------ visoes
 
 /**
+ * Aba Cortes: resumo do dia (X de N) e a lista dos clipes ja gerados. Le do
+ * disco a cada chamada — a verdade dos cortes esta no `cortes.json` de cada
+ * novela, nao na memoria do app.
+ */
+async function renderCortes() {
+  let sum: CortesSummary;
+  try {
+    sum = await invoke<CortesSummary>("cortes_summary");
+  } catch {
+    return;
+  }
+
+  $("#cortes-status").textContent =
+    sum.quota > 0 ? `${sum.generated} de ${sum.quota} hoje` : "geração automática desligada";
+  const marca: Record<string, string> = {
+    remover: "Marca de origem: removida dos clipes.",
+    cobrir: "Marca de origem: coberta pela nossa marca.",
+    manter: "Marca de origem: mantida como está.",
+  };
+  $("#cortes-strategy").textContent = marca[sum.sourceMark] ?? "";
+  $("#tab-cortes-count").textContent = sum.generated ? String(sum.generated) : "";
+  $<HTMLButtonElement>("#cortes-run").disabled = sum.quota === 0;
+
+  const empty = $("#cortes-empty");
+  const list = $("#cortes-list");
+  empty.hidden = sum.clips.length > 0;
+  list.textContent = "";
+  for (const c of sum.clips) {
+    const row = document.createElement("div");
+    row.className = "cortes-row";
+    row.setAttribute("role", "listitem");
+
+    const info = document.createElement("div");
+    info.className = "cortes-info";
+    const nome = document.createElement("strong");
+    nome.textContent = c.novela;
+    const sub = document.createElement("span");
+    sub.className = "muted";
+    // Origem e duracao: o que o operador precisa para reconhecer o clipe.
+    sub.textContent = `${c.sourceEpisode} · ${duration(Math.round(c.endSec - c.startSec))}`;
+    info.append(nome, sub);
+
+    const tools = document.createElement("div");
+    tools.className = "cortes-tools";
+    const abrir = document.createElement("button");
+    abrir.className = "btn btn-sm";
+    abrir.type = "button";
+    abrir.textContent = "Abrir pasta";
+    // open_path abre a pasta quando o alvo e um arquivo.
+    abrir.addEventListener("click", () => invoke("open_path", { path: c.path }));
+    tools.append(abrir);
+
+    row.append(info, tools);
+    list.append(row);
+  }
+}
+
+async function runCortesNow() {
+  const btn = $<HTMLButtonElement>("#cortes-run");
+  btn.disabled = true;
+  btn.textContent = "Gerando…";
+  try {
+    const r = await invoke<CortesReport>("cortes_run_now");
+    if (r.deferred) {
+      banner("Há download em andamento — o lote fica para quando a fila esvaziar.");
+    } else {
+      const falhas = r.failures.length ? `, ${r.failures.length} falha(s)` : "";
+      banner(`${r.generated} clipe(s) gerado(s)${falhas}.`, "is-ok");
+    }
+  } catch (e) {
+    banner(String(e), "is-error");
+  } finally {
+    btn.textContent = "Gerar agora";
+    renderCortes();
+  }
+}
+
+/**
  * Troca a visão sem desmontar nada.
  *
  * `hidden`, nunca remoção: o render da fila reconcilia as linhas por chave e
@@ -1605,11 +1746,12 @@ async function refreshDisk() {
  * o mapa cheio de nós órfãos e a fila voltaria a congelar — o defeito mais
  * caro que este app já teve.
  */
-function showView(which: "queue" | "watch" | "discover") {
-  const abas: Array<["queue" | "watch" | "discover", string, string]> = [
+function showView(which: "queue" | "watch" | "discover" | "cortes") {
+  const abas: Array<["queue" | "watch" | "discover" | "cortes", string, string]> = [
     ["queue", "#tab-queue", "#view-queue"],
     ["watch", "#tab-watch", "#view-watch"],
     ["discover", "#tab-discover", "#view-discover"],
+    ["cortes", "#tab-cortes", "#view-cortes"],
   ];
   for (const [nome, tabSel, viewSel] of abas) {
     const ativa = nome === which;
@@ -1671,6 +1813,16 @@ function wire() {
     showView("discover");
     refreshDiscoverHave();
   });
+  // Ao abrir a aba, releitura do disco: uma rodada noturna pode ter gerado
+  // clipes desde a ultima vez.
+  $("#tab-cortes").addEventListener("click", () => {
+    showView("cortes");
+    renderCortes();
+  });
+  $("#cortes-run").addEventListener("click", runCortesNow);
+  $("#cortes-open").addEventListener("click", () =>
+    invoke("open_path", { path: settings.dest_dir }),
+  );
 
   // Vitrine. Nada é buscado ao abrir a aba: a consulta é uma ação explícita,
   // porque ela divide a sessão com a fila que pode estar correndo.
@@ -2013,6 +2165,7 @@ async function main() {
 
   wire();
   await loadSettings();
+  await renderCortes();
   await refreshAuth();
   await refreshQueue();
   await refreshFollows();
@@ -2023,13 +2176,39 @@ async function main() {
     follows = e.payload;
     renderFollows();
   });
+  await listen<CortesReport>("cortes://run", () => {
+    renderCortes();
+  });
+  // Rodada automática terminou. Avisa também quando não achou nada: "rodou e
+  // não tinha episódio novo" é a prova de que o acompanhamento está vivo.
   await listen<WatchReport>("watch://run", (e) => {
     const r = e.payload;
     if (r.added > 0) {
-      banner(`${r.added} episódio(s) novo(s) entraram na fila sozinhos.`, "is-ok");
+      banner(`Verificação automática: ${r.added} episódio(s) novo(s) entraram na fila sozinhos.`, "is-ok");
       refreshQueue();
+    } else if (r.checked > 0 || r.stopped || r.errors.length) {
+      const partes = [`Verificação automática: nada novo em ${r.checked} novela(s)`];
+      if (r.stopped) partes.push(r.stopped);
+      if (r.errors.length) partes.push(`${r.errors.length} com erro`);
+      banner(partes.join(" · "), r.errors.length ? "is-error" : "is-ok");
     }
   });
+
+  // Uma rodada (manual ou automática) espera 20s entre uma novela e outra.
+  await listen<{ done: number; total: number; name: string; eta_secs: number }>(
+    "watch://progress",
+    (e) => {
+      const { done, total, name, eta_secs } = e.payload;
+      setActivity(
+        "watch",
+        name
+          ? `Verificando novelas ${Math.min(done + 1, total)}/${total} — ${name}` +
+              (eta_secs > 0 ? ` · faltam ~${duration(eta_secs)}` : "")
+          : "",
+      );
+      renderFollows();
+    },
+  );
 
   // O lote também espera 20s entre uma novela e outra: sem dizer em qual está,
   // a janela ficaria um quarto de hora parecendo travada.
@@ -2047,10 +2226,22 @@ async function main() {
 
   // A varredura de metadados espera 20s entre uma novela e outra. Sem mostrar
   // em qual pasta esta, o botao ficaria minutos parado parecendo travado.
-  await listen<{ done: number; total: number; folder: string }>("meta://progress", (e) => {
-    const { done, total, folder } = e.payload;
-    $("#meta-status").textContent = folder ? `${done + 1}/${total} — ${folder}` : "";
-  });
+  // Duas etapas: a local (ffmpeg em cada episódio, minutos) e a online (20s por
+  // novela). Sem dizer qual, a local parecia travada e a online parecia recomeçar.
+  await listen<{ done: number; total: number; folder: string; phase: string; eta_secs: number }>(
+    "meta://progress",
+    (e) => {
+      const { done, total, folder, phase, eta_secs } = e.payload;
+      const etapa =
+        phase === "local" ? "Etapa 1/2: conferindo arquivos no disco" : "Etapa 2/2: consultando os sites";
+      const texto = folder
+        ? `${etapa} · ${Math.min(done + 1, total)}/${total} — ${folder}` +
+          (eta_secs > 0 ? ` · faltam ~${duration(eta_secs)}` : "")
+        : "";
+      $("#meta-status").textContent = texto;
+      setActivity("meta", texto ? `Metadados — ${texto}` : "");
+    },
+  );
 
   // Queda e volta da internet. A fila não trava: ela espera, e volta sozinha.
   await listen<boolean>("queue://offline", (e) => {

@@ -65,6 +65,17 @@
           Descobrir
           <span id="tab-discover-count" class="tab-count"></span>
         </button>
+        <button
+          id="tab-cortes"
+          class="tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="view-cortes"
+        >
+          Cortes
+          <span id="tab-cortes-count" class="tab-count"></span>
+        </button>
       </nav>
 
       <div class="topbar-right">
@@ -253,10 +264,43 @@
           </button>
         </div>
       </section>
+
+      <!--
+        Cortes: pos-producao sobre o acervo local. Nao baixa, nao publica — so
+        transforma episodios ja no disco em clipes verticais marcados.
+      -->
+      <section id="view-cortes" class="view" role="tabpanel" aria-labelledby="tab-cortes" hidden>
+        <div class="view-head">
+          <h2>Cortes</h2>
+          <div class="view-tools">
+            <span id="cortes-status" class="muted"></span>
+            <button id="cortes-open" class="btn btn-sm" type="button">Abrir pasta</button>
+            <button id="cortes-run" class="btn btn-sm btn-primary" type="button">Gerar agora</button>
+          </div>
+        </div>
+        <p id="cortes-strategy" class="muted"></p>
+
+        <div id="cortes-empty" class="empty">
+          <p class="empty-title">Clipes verticais a partir do que você já tem</p>
+          <p class="empty-hint">
+            O lote diário escolhe episódios do acervo, recorta a melhor janela de
+            ~45s, normaliza para 1080×1920 e aplica a marca <strong>Noveleiras de
+            plantão</strong> — arquivos prontos para o canal vertical.
+          </p>
+          <p class="empty-hint">
+            Ele roda sozinho uma vez por dia e nunca compete com um download em
+            andamento. A cota e a marca ficam em <strong>Ajustes → Cortes</strong>.
+          </p>
+        </div>
+
+        <div id="cortes-list" class="cortes-list" role="list"></div>
+      </section>
     </main>
 
     <footer class="statusbar">
       <span id="stat-counts" class="stat"></span>
+      <!-- Trabalho demorado em andamento (metadados, verificação), visível de qualquer aba. -->
+      <span id="stat-activity" class="stat" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" hidden></span>
       <span class="stat-sep" aria-hidden="true"></span>
       <span id="stat-progress" class="stat num"></span>
       <span id="stat-eta" class="stat num"></span>
@@ -460,6 +504,7 @@
           <button class="subtab is-active" data-settings-tab="geral" type="button" role="tab" aria-selected="true">Geral</button>
           <button class="subtab" data-settings-tab="downloads" type="button" role="tab" aria-selected="false">Downloads</button>
           <button class="subtab" data-settings-tab="auto" type="button" role="tab" aria-selected="false">Automático</button>
+          <button class="subtab" data-settings-tab="cortes" type="button" role="tab" aria-selected="false">Cortes</button>
           <button class="subtab" data-settings-tab="biblioteca" type="button" role="tab" aria-selected="false">Biblioteca</button>
         </nav>
 
@@ -575,6 +620,49 @@
               mostrar isso, ele ajustaria os limites no escuro.
             -->
             <p id="auto-math" class="setting-note"></p>
+          </div>
+
+          <!-- Cortes -->
+          <div class="settings-pane" data-settings-pane="cortes" hidden>
+            <label class="setting">
+              <span class="setting-label">Clipes por dia</span>
+              <div class="setting-row">
+                <input id="set-cortes-quota" type="number" min="0" max="50" step="1" />
+              </div>
+              <span class="setting-hint">
+                Quantos clipes o lote diário tenta gerar. <strong>0 desliga</strong> a
+                geração automática. No máximo 2 por novela por dia. O lote roda uma vez
+                por dia e nunca compete com um download em andamento.
+              </span>
+            </label>
+
+            <label class="check-setting">
+              <input id="set-cortes-watermark" type="checkbox" />
+              <span>
+                <strong>Marca d'água "Noveleiras de plantão"</strong>
+                <span class="setting-hint">
+                  Pill escuro discreto no rodapé de cada clipe. Ligado por padrão.
+                </span>
+              </span>
+            </label>
+
+            <label class="setting">
+              <span class="setting-label">Marca embutida de origem</span>
+              <div class="setting-row">
+                <select id="set-cortes-source-mark">
+                  <option value="remover">Remover</option>
+                  <option value="cobrir">Cobrir com a nossa marca</option>
+                  <option value="manter">Manter</option>
+                </select>
+              </div>
+              <span class="setting-hint">
+                O logotipo que a plataforma grava no vídeo e move pela tela (ex.:
+                ReelShort). <strong>Remover</strong> apaga a marca de origem por
+                onde ela passa; <strong>Cobrir</strong> põe a nossa marca por cima
+                dela enquanto aparece; <strong>Manter</strong> deixa como está.
+                Fontes sem perfil reconhecido passam sem alteração.
+              </span>
+            </label>
           </div>
 
           <!-- Biblioteca -->

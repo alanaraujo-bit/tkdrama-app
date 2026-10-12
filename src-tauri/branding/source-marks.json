@@ -1,0 +1,8 @@
+{
+  "_nota": "Perfil por origem da marca embutida na captura. A chave e a 'source' do manifest.json. So origens com referencial commitado aparecem aqui; as demais (tiktok, dramabox, candyjar) ficam 'nao observadas' ate existir um referencial, e seus episodios passam pelo pipeline sem deteccao, exatamente como antes. 'reference' e o PNG em cinza (src-tauri/branding/), 'scales' as escalas testadas em torno do tamanho nominal do referencial no canvas 1080x1920, 'threshold' o ZNCC minimo para uma deteccao.",
+  "reelshort": {
+    "reference": "reelshort-mark.png",
+    "scales": [0.85, 1.0, 1.18],
+    "threshold": 0.62
+  }
+}

@@ -8,6 +8,7 @@ mod awake;
 mod backfill;
 mod bulk;
 pub mod candyjar;
+pub mod cortes;
 pub mod dramabox;
 mod disk;
 pub mod manifest;
@@ -19,7 +20,7 @@ mod tiktok;
 mod watch;
 
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
@@ -1103,6 +1104,9 @@ async fn watch_run_now(app: AppHandle) -> Res<watch::Report> {
     Ok(watch::run_once(&app, true).await)
 }
 
+/// Ligado pelo "Sair" da bandeja, para o X da janela nao engolir o encerramento.
+static SAINDO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // -------------------------------------------------------------------- metadados
 
 /// "Atualizar metadados": percorre as pastas ja baixadas e escreve a ficha de
@@ -1192,6 +1196,23 @@ fn settings_set(app: AppHandle, state: State<'_, Arc<AppState>>, settings: Setti
     s.codec = if settings.codec == "h265" { "h265" } else { "h264" }.into();
     s.gear = settings.gear.filter(|g| !g.trim().is_empty());
     s.sequential = settings.sequential;
+    // Sem estas linhas o interruptor do automatico era so visual: a interface
+    // guardava "ligado" e o laco em `watch.rs` continuava lendo "desligado".
+    s.auto_enabled = settings.auto_enabled;
+    s.auto_interval_hours = settings.auto_interval_hours.clamp(1, 24);
+    s.auto_max_new_series = settings.auto_max_new_series;
+    s.auto_max_gb_per_run = settings.auto_max_gb_per_run.max(0.0);
+    s.auto_min_free_gb = settings.auto_min_free_gb.max(0.0);
+    s.cortes_daily_quota = settings.cortes_daily_quota;
+    s.cortes_watermark = settings.cortes_watermark;
+    s.cortes_embalagem = settings.cortes_embalagem;
+    // So os tres valores conhecidos; qualquer outro cai no padrao ("remover").
+    s.cortes_source_mark = match settings.cortes_source_mark.as_str() {
+        "cobrir" => "cobrir",
+        "manter" => "manter",
+        _ => "remover",
+    }
+    .into();
     drop(s);
     state.mark_dirty();
     queue::save(&app);
@@ -1433,6 +1454,119 @@ fn open_path(app: AppHandle, path: String) -> Res<()> {
         .map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------------------------- cortes
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Dois instantes caem no mesmo dia UTC? Base do "no maximo uma vez por dia".
+fn mesmo_dia_utc(a: u64, b: u64) -> bool {
+    a != 0 && manifest::iso_utc(a).get(..10) == manifest::iso_utc(b).get(..10)
+}
+
+/// Ha download que o lote nao pode atropelar (em andamento ou na fila).
+fn download_ativo(state: &AppState) -> bool {
+    state
+        .tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|t| matches!(t.status, Status::Running | Status::Queued))
+}
+
+/// Resumo do dia (X de N) e a lista dos clipes de hoje, para a aba Cortes.
+#[tauri::command]
+fn cortes_summary(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    let (root, quota, source_mark) = {
+        let s = state.settings.lock().unwrap();
+        (s.dest_dir.clone(), s.cortes_daily_quota, s.cortes_source_mark.clone())
+    };
+    let sum = cortes::summary(std::path::Path::new(&root));
+    serde_json::json!({
+        "day": sum.day,
+        "quota": quota,
+        "generated": sum.generated,
+        "sourceMark": source_mark,
+        "clips": sum.clips,
+    })
+}
+
+/// Gera o lote agora (botao "Gerar agora"): ignora o "uma vez por dia", mas
+/// ainda adia se ha download em andamento — o corte nunca compete com o download.
+#[tauri::command]
+async fn cortes_run_now(app: AppHandle) -> Res<cortes::LoteReport> {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let (root, quota, watermark, source_mark, packaging) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.dest_dir.clone(),
+            s.cortes_daily_quota,
+            s.cortes_watermark,
+            cortes::SourceMark::parse(&s.cortes_source_mark),
+            s.cortes_embalagem,
+        )
+    };
+    if quota == 0 {
+        return Err("A cota diaria de cortes esta em zero (desligada nos Ajustes).".into());
+    }
+    if download_ativo(&state) {
+        return Ok(cortes::LoteReport {
+            deferred: true,
+            quota,
+            ..Default::default()
+        });
+    }
+    let opts = cortes::ClipOptions { watermark, source_mark, packaging };
+    let report = cortes::run_lote(std::path::Path::new(&root), quota, &opts).await;
+    *state.cortes_last_run.lock().unwrap() = now_secs();
+    state.mark_dirty();
+    queue::save(&app);
+    let _ = app.emit("cortes://run", report.clone());
+    Ok(report)
+}
+
+/// Laco de fundo do lote diario. Mesmo espirito do `watch::start`: acorda de
+/// tempos em tempos, dispara no maximo uma vez por dia, e nunca enquanto ha
+/// download ativo — nesse caso adia sem carimbar, para nao queimar o dia.
+fn start_cortes(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            let state = app.state::<Arc<AppState>>().inner().clone();
+            let (root, quota, watermark, source_mark, packaging) = {
+                let s = state.settings.lock().unwrap();
+                (
+                    s.dest_dir.clone(),
+                    s.cortes_daily_quota,
+                    s.cortes_watermark,
+                    cortes::SourceMark::parse(&s.cortes_source_mark),
+                    s.cortes_embalagem,
+                )
+            };
+            if quota == 0 {
+                continue; // cota zero = geracao automatica desligada
+            }
+            if mesmo_dia_utc(*state.cortes_last_run.lock().unwrap(), now_secs()) {
+                continue; // ja rodou hoje
+            }
+            if download_ativo(&state) {
+                continue; // adia sem carimbar: a fila esvazia e a proxima volta pega
+            }
+            // Carimba so agora, que vai realmente rodar.
+            *state.cortes_last_run.lock().unwrap() = now_secs();
+            state.mark_dirty();
+            let opts = cortes::ClipOptions { watermark, source_mark, packaging };
+            let report = cortes::run_lote(std::path::Path::new(&root), quota, &opts).await;
+            queue::save(&app);
+            let _ = app.emit("cortes://run", report);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1449,23 +1583,33 @@ pub fn run() {
             queue::start_connectivity_probe(handle.clone());
             queue::start_janitor(handle.clone());
             watch::start(handle.clone());
+            start_cortes(handle.clone());
 
             // Fechar a janela minimiza para a bandeja: o processo e a fila
             // seguem vivos. Um clique no icone restaura a janela.
             let show = MenuItem::with_id(app, "show", "Abrir tkdrama", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show])?;
+            // Sem isto a unica saida era o Gerenciador de Tarefas. O estado e
+            // salvo antes; o que estava baixando volta para a fila ao abrir.
+            let quit = MenuItem::with_id(app, "quit", "Sair do tkdrama", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
             let icon = app.default_window_icon().cloned();
             let mut tray = TrayIconBuilder::with_id("downloads")
                 .menu(&menu)
                 .tooltip("tkdrama — downloads em andamento")
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| {
-                    if event.id().as_ref() == "show" {
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
                     }
+                    "quit" => {
+                        SAINDO.store(true, std::sync::atomic::Ordering::SeqCst);
+                        queue::save(app);
+                        app.exit(0);
+                    }
+                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
@@ -1486,6 +1630,10 @@ pub fn run() {
                 let h = handle.clone();
                 main.on_window_event(move |e| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = e {
+                        // "Sair" pela bandeja: aqui nao se esconde, se encerra.
+                        if SAINDO.load(std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
                         api.prevent_close();
                         queue::save(&h);
                         if let Some(window) = h.get_webview_window("main") {
@@ -1528,6 +1676,8 @@ pub fn run() {
             bulk_add,
             bulk_cancel,
             bulk_running,
+            cortes_summary,
+            cortes_run_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

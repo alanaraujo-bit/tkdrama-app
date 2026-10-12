@@ -187,7 +187,13 @@ src-tauri/src/
   media.rs      tipos comuns e escolha de qualidade
   manifest.rs   ficha da novela em disco: manifest.json, capa, miniaturas
   backfill.rs   varredura que dá ficha ao que já foi baixado
+  cortes.rs     clipes verticais 1080×1920 a partir do acervo; detecta e remove,
+                cobre ou mantém a marca embutida de origem (ex.: ReelShort)
   disk.rs       espaço livre em disco
+src-tauri/branding/  referencial da marca de origem (PNG) + perfil por origem
+                     (source-marks.json), embutidos no binário
+scripts/
+  watermark.py  gera, uma vez, o PNG da nossa marca d'água (commitado)
 tiktok-drama-dl/  protótipo anterior em Python, que originou o app
 ```
 

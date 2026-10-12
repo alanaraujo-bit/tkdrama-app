@@ -51,9 +51,15 @@ pub struct Report {
 /// Progresso, para a interface nao virar uma janela morta durante a varredura.
 #[derive(Serialize, Clone, Debug)]
 struct Progress {
+    /// "local" (conferindo arquivos no disco) ou "online" (consultando os
+    /// sites). Sao duas passadas pela biblioteca inteira; sem dizer qual, o
+    /// contador parece voltar para o comeco.
+    phase: &'static str,
     done: usize,
     total: usize,
     folder: String,
+    /// Estimativa do que falta nesta etapa. 0 = ainda sem base para estimar.
+    eta_secs: u64,
 }
 
 /// A novela de uma pasta, identificada.
@@ -195,7 +201,29 @@ pub async fn run(app: &AppHandle) -> Result<Report, String> {
     // identidade aparece de imediato, sem esperar a fila de consultas.
     // Primeiro repara tudo que depende apenas do disco. Assim `.ts` antigos,
     // thumbnails ausentes e manifestos incompletos não dependem de login.
-    for dir in &pastas {
+    // Essa passada leva minutos (ffmpeg em cada episodio) e antes nao dizia
+    // nada: o botao ficava em "Atualizando..." sem numero nenhum.
+    let n_pastas = pastas.len();
+    let inicio = std::time::Instant::now();
+    for (i, dir) in pastas.iter().enumerate() {
+        let eta_secs = if i > 0 {
+            (inicio.elapsed().as_secs_f64() / i as f64 * (n_pastas - i) as f64) as u64
+        } else {
+            0
+        };
+        let _ = app.emit(
+            "meta://progress",
+            Progress {
+                phase: "local",
+                done: i,
+                total: n_pastas,
+                folder: dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                eta_secs,
+            },
+        );
         match manifest::backfill_local(dir).await {
             Ok(local) => {
                 report.converted += local.converted;
@@ -245,9 +273,11 @@ pub async fn run(app: &AppHandle) -> Result<Report, String> {
         let _ = app.emit(
             "meta://progress",
             Progress {
+                phase: "online",
                 done: i,
                 total,
                 folder: nome.clone(),
+                eta_secs: (total - i) as u64 * PACE.as_secs(),
             },
         );
         // Espacamento antes da consulta, nunca depois da ultima.
@@ -281,9 +311,11 @@ pub async fn run(app: &AppHandle) -> Result<Report, String> {
     let _ = app.emit(
         "meta://progress",
         Progress {
+            phase: "online",
             done: total,
             total,
             folder: String::new(),
+            eta_secs: 0,
         },
     );
     Ok(report)

@@ -379,7 +379,8 @@ svg {
 
 /* A lista rola; o cabecalho fica. */
 .view > .queue-list,
-.view > .watch-list {
+.view > .watch-list,
+.view > .cortes-list {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -535,6 +536,55 @@ svg {
 .watch-list {
   display: flex;
   flex-direction: column;
+}
+
+.cortes-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.cortes-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: var(--row-h);
+  padding: 8px 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.cortes-row:last-child {
+  border-bottom: none;
+}
+
+.cortes-row:hover {
+  background: var(--surface-2);
+}
+
+.cortes-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cortes-info strong,
+.cortes-info span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cortes-info strong {
+  font-weight: 550;
+}
+
+.cortes-info span {
+  font-size: 12px;
+}
+
+.cortes-tools {
+  flex-shrink: 0;
 }
 
 .watch-row {

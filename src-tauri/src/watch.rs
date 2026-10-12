@@ -125,6 +125,29 @@ fn clear_blocked(state: &AppState, source: Source, drama_id: &str) -> usize {
     antes - tasks.len()
 }
 
+/// Andamento de uma rodada, para a interface nao ficar em "Verificando..." mudo.
+#[derive(Serialize, Clone, Debug)]
+struct Progress {
+    done: usize,
+    total: usize,
+    name: String,
+    eta_secs: u64,
+}
+
+/// Ordem em que a rodada olha as series: a que esta ha mais tempo sem ser
+/// verificada vem primeiro (nunca verificada = 0, na frente de todas).
+///
+/// Sem isto o teto de series por rodada virava venda: a rodada seguia a ordem
+/// da lista, entao olhava sempre as mesmas N primeiras e as outras nunca — 210
+/// de 220 acompanhadas estavam assim. Com a ordem por `last_check`, o teto so
+/// divide o trabalho entre rodadas. `sort_by_key` e estavel: empate mantem a
+/// ordem da lista.
+fn ordem_da_rodada(follows: Vec<Follow>) -> Vec<Follow> {
+    let mut alvos: Vec<Follow> = follows.into_iter().filter(|f| !f.paused).collect();
+    alvos.sort_by_key(|f| f.last_check);
+    alvos
+}
+
 pub fn list(state: &AppState) -> Vec<Follow> {
     state.follows.lock().unwrap().clone()
 }
@@ -191,9 +214,14 @@ pub async fn run_once(app: &AppHandle, manual: bool) -> Report {
         }
     }
 
-    let alvos: Vec<Follow> = list(&state).into_iter().filter(|f| !f.paused).collect();
+    let alvos = ordem_da_rodada(list(&state));
     let teto = (max_run_gb * GB as f64) as u64;
     let mut gastos: u64 = 0;
+    let total = if max_series > 0 {
+        alvos.len().min(max_series)
+    } else {
+        alvos.len()
+    };
 
     for (i, follow) in alvos.iter().enumerate() {
         if max_series > 0 && i >= max_series {
@@ -204,6 +232,15 @@ pub async fn run_once(app: &AppHandle, manual: bool) -> Report {
             report.stopped = Some(format!("Teto de {max_run_gb:.1} GB por rodada."));
             break;
         }
+        let _ = app.emit(
+            "watch://progress",
+            Progress {
+                done: i,
+                total,
+                name: follow.name.clone(),
+                eta_secs: (total - i) as u64 * PACE.as_secs(),
+            },
+        );
         // Espacamento entre series. Antes da consulta, nunca depois da ultima.
         if i > 0 {
             tokio::time::sleep(PACE).await;
@@ -248,6 +285,15 @@ pub async fn run_once(app: &AppHandle, manual: bool) -> Report {
         }
     }
 
+    let _ = app.emit(
+        "watch://progress",
+        Progress {
+            done: report.checked,
+            total,
+            name: String::new(),
+            eta_secs: 0,
+        },
+    );
     if report.checked > 0 {
         state.mark_dirty();
         queue::save(app);
@@ -334,6 +380,46 @@ mod tests {
         assert_eq!(restante[0].source, Source::Reelshort);
     }
 
+    /// O teto de series por rodada tem de revezar a lista inteira. Antes a
+    /// rodada seguia a ordem da lista e as series depois do teto nunca eram
+    /// olhadas.
+    #[test]
+    fn rodada_comeca_pela_que_esta_ha_mais_tempo_sem_verificar() {
+        let mut a = seguir(Source::Tiktok, "a");
+        a.last_check = 300;
+        let b = seguir(Source::Tiktok, "b");
+        let mut c = seguir(Source::Tiktok, "c");
+        c.last_check = 100;
+        let mut d = seguir(Source::Tiktok, "d");
+        d.paused = true;
+        let e = seguir(Source::Tiktok, "e");
+        let ordem: Vec<String> = ordem_da_rodada(vec![a, b, c, d, e])
+            .into_iter()
+            .map(|f| f.drama_id)
+            .collect();
+        // Nunca verificadas primeiro (na ordem da lista), pausada fora.
+        assert_eq!(ordem, ["b", "e", "c", "a"]);
+    }
+
+    /// Com teto 2 e 5 series, tres rodadas cobrem todas.
+    #[test]
+    fn o_teto_reveza_ate_cobrir_todas() {
+        let mut follows: Vec<Follow> = (0..5).map(|i| seguir(Source::Tiktok, &i.to_string())).collect();
+        let mut vistas = std::collections::HashSet::new();
+        for rodada in 1..=3u64 {
+            let alvo: Vec<String> = ordem_da_rodada(follows.clone())
+                .into_iter()
+                .take(2)
+                .map(|f| f.drama_id)
+                .collect();
+            for f in follows.iter_mut().filter(|f| alvo.contains(&f.drama_id)) {
+                f.last_check = rodada;
+            }
+            vistas.extend(alvo);
+        }
+        assert_eq!(vistas.len(), 5);
+    }
+
     #[test]
     fn pausar_nao_remove_da_lista() {
         let state = AppState::new();
@@ -405,10 +491,10 @@ pub fn start(app: AppHandle) {
                 continue;
             }
             *state.last_run.lock().unwrap() = now_secs();
+            // Sempre avisa, mesmo sem nada novo: rodada que nao encontra nada
+            // e informacao ("esta funcionando"), nao silencio.
             let relatorio = run_once(&app, false).await;
-            if relatorio.added > 0 {
-                let _ = app.emit("watch://run", relatorio);
-            }
+            let _ = app.emit("watch://run", relatorio);
         }
     });
 }

@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
-use tkdrama_app_lib::{download, manifest, media, reelshort};
+use tkdrama_app_lib::{cortes, download, manifest, media, reelshort};
 
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,7 +127,7 @@ async fn download_reelshort(url: &str, root: &Path, count: usize) -> anyhow::Res
     let control = Arc::new(AtomicU8::new(download::RUN));
     // Trailer antes dos episodios: e o arquivo mais leve e o que completa a
     // pasta para publicacao. Falhar aqui nao impede o resto.
-    if let Ok(Some(t)) = manifest::ensure_trailer(&client, &series, &dir, &session, control.clone()).await {
+    if let Ok(Some(t)) = manifest::ensure_trailer(&client, &series, &dir, &session, "", control.clone()).await {
         m.trailer = Some(t);
         manifest::write(&dir, &m)?;
     }
@@ -146,10 +146,141 @@ async fn download_reelshort(url: &str, root: &Path, count: usize) -> anyhow::Res
     Ok(dir)
 }
 
+/// Le `dest_dir` e o interruptor da marca do `state.json` do app.
+///
+/// A CLI nao tem o contexto do Tauri, mas o identifier e fixo
+/// (`com.tkdrama.app`), entao o mesmo estado que a interface grava e legivel
+/// aqui. Leve por `Value` para nao acoplar ao struct `Settings`.
+fn cortes_defaults() -> (Option<PathBuf>, bool, String, bool) {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return (None, true, "remover".into(), true);
+    };
+    let path = PathBuf::from(appdata).join("com.tkdrama.app").join("state.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (None, true, "remover".into(), true);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (None, true, "remover".into(), true);
+    };
+    let s = &v["settings"];
+    let root = s["dest_dir"].as_str().map(PathBuf::from);
+    // Ausente = ligado (padrao do produto).
+    let marca = s["cortes_watermark"].as_bool().unwrap_or(true);
+    let source_mark = s["cortes_source_mark"].as_str().unwrap_or("remover").to_string();
+    let embalagem = s["cortes_embalagem"].as_bool().unwrap_or(true);
+    (root, marca, source_mark, embalagem)
+}
+
+/// Escolhe a estrategia da marca de origem: `--marca-origem <remover|cobrir|manter>`
+/// se dado, senao o padrao do app.
+fn source_mark_arg(args: &[String], padrao: &str) -> cortes::SourceMark {
+    let escolhido = args
+        .iter()
+        .position(|a| a == "--marca-origem")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+        .unwrap_or(padrao);
+    cortes::SourceMark::parse(escolhido)
+}
+
+async fn cortes_cmd(args: &[String]) -> anyhow::Result<()> {
+    let sem_marca = args.iter().any(|a| a == "--sem-marca");
+    let sem_embalagem = args.iter().any(|a| a == "--sem-embalagem");
+    let (root_padrao, marca_padrao, source_mark_padrao, embalagem_padrao) = cortes_defaults();
+    let marca = marca_padrao && !sem_marca;
+    let embalagem = embalagem_padrao && !sem_embalagem;
+    let source_mark = source_mark_arg(args, &source_mark_padrao);
+    // `--saida <arquivo>`: renderiza para um caminho explicito SEM registrar no
+    // indice da novela — QA de render sem "queimar" o episodio do pool do lote.
+    let saida = args
+        .iter()
+        .position(|a| a == "--saida")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+    // Valores consumidos por flags nao contam como caminho solto.
+    let consumido = |i: usize| {
+        matches!(
+            args.get(i.wrapping_sub(1)).map(String::as_str),
+            Some("--n") | Some("--marca-origem") | Some("--saida")
+        )
+    };
+    match args.first().map(String::as_str) {
+        Some("um") => {
+            let arquivo = args
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(i, a)| !a.starts_with("--") && !consumido(*i))
+                .map(|(_, a)| a)
+                .ok_or_else(|| anyhow::anyhow!("uso: tkdrama-media cortes um <arquivo> [--saida <mp4>] [--sem-marca] [--sem-embalagem] [--marca-origem <remover|cobrir|manter>]"))?;
+            let opts = cortes::ClipOptions { watermark: marca, source_mark, packaging: embalagem };
+            match saida {
+                Some(dest) => {
+                    let entry = cortes::make_clip_to(Path::new(arquivo), &dest, &opts).await?;
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                }
+                None => {
+                    let entry = cortes::make_clip(Path::new(arquivo), &opts).await?;
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                }
+            }
+            Ok(())
+        }
+        Some("marcas") => {
+            // QA da deteccao: roda (ou --forca) e imprime a linha do tempo.
+            let arquivo = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .ok_or_else(|| anyhow::anyhow!("uso: tkdrama-media cortes marcas <arquivo> [--forca]"))?;
+            let force = args.iter().any(|a| a == "--forca" || a == "--forcar");
+            let source = Path::new(arquivo);
+            let novela_dir = source
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("arquivo sem pasta"))?;
+            let segments = cortes::timeline_for(source, novela_dir, force).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "arquivo": arquivo,
+                    "segmentos": segments,
+                }))?
+            );
+            Ok(())
+        }
+        Some("lote") => {
+            // `--n <N>` para a cota; um caminho solto sobrescreve a raiz padrao.
+            let n = args
+                .iter()
+                .position(|a| a == "--n")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(10);
+            // Um caminho solto sobrescreve a raiz; ignora flags e o valor que cada
+            // uma consome (`--n <N>`, `--marca-origem <v>`), para nao confundir
+            // "remover"/"cobrir"/"manter" com a raiz da biblioteca.
+            let root = args
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(i, a)| !a.starts_with("--") && a.parse::<usize>().is_err() && !consumido(*i))
+                .map(|(_, a)| PathBuf::from(a))
+                .or(root_padrao)
+                .ok_or_else(|| anyhow::anyhow!("sem raiz da biblioteca: passe o caminho ou configure o app"))?;
+            let opts = cortes::ClipOptions { watermark: marca, source_mark, packaging: embalagem };
+            let report = cortes::run_lote(&root, n, &opts).await;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        _ => anyhow::bail!("uso: tkdrama-media cortes <um|lote|marcas> ..."),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("cortes") => cortes_cmd(&args[2..]).await,
         Some("backfill") => backfill(Path::new(args.get(2).ok_or_else(|| anyhow::anyhow!("uso: tkdrama-media backfill <pasta>"))?)).await,
         Some("validate") => {
             let report = validate(Path::new(args.get(2).ok_or_else(|| anyhow::anyhow!("uso: tkdrama-media validate <pasta-da-novela>"))?)).await?;
@@ -163,6 +294,6 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", download_reelshort(url, root, count).await?.display());
             Ok(())
         }
-        _ => anyhow::bail!("comandos: download, backfill, validate"),
+        _ => anyhow::bail!("comandos: download, backfill, validate, cortes"),
     }
 }
